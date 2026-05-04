@@ -34,8 +34,10 @@ def mock_deps(monkeypatch):
 @pytest.fixture
 def threat_agent(mock_deps, monkeypatch):
     monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value="threat context"))
-    monkeypatch.setattr("core.tools.threat_tools.lookup_ip_reputation",
-                        AsyncMock(return_value=json.dumps({"abuse_confidence_score": 90})))
+    monkeypatch.setattr("core.tools.threat_tools.enrich_ip",
+                        AsyncMock(return_value=json.dumps({"ip": "185.220.101.45", "risk_score": 80})))
+    monkeypatch.setattr("core.tools.threat_tools.score_ioc",
+                        AsyncMock(return_value=json.dumps({"ioc": "185.220.101.45", "risk_score": 60})))
     with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
         llm_instance = _make_mock_llm({
             "threat_type": "port_scan", "severity": "high", "confidence": 0.9,

@@ -7,7 +7,7 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
-from core.tools.threat_tools import THREAT_TOOLS
+from core.tools.threat_tools import enrich_ip, score_ioc
 from core.rag.rag_chain import threat_rag
 from core.database.redis_client import cache
 
@@ -98,15 +98,18 @@ class ThreatDetectionAgent(BaseSecurityAgent):
         indicators = assessment.get("indicators", [])
         enrichment = {}
 
-        for ioc in indicators[:3]:  # limit to 3 IOCs to avoid rate limits
+        for ioc in indicators[:3]:
             tool_results = []
-            if "." in str(ioc) and not ioc.startswith("http"):
-                from core.tools.threat_tools import lookup_ip_reputation
-                result = await lookup_ip_reputation.ainvoke({"ip": ioc})
-                tool_results.append(result)
-                result2 = await lookup_virustotal_safe(ioc)
-                if result2:
-                    tool_results.append(result2)
+            try:
+                tool_results.append(await score_ioc.ainvoke({"ioc": ioc}))
+            except Exception:
+                pass
+            try:
+                import ipaddress
+                ipaddress.ip_address(ioc)
+                tool_results.append(await enrich_ip.ainvoke({"ip": ioc}))
+            except (ValueError, Exception):
+                pass
 
             if tool_results:
                 chain = ENRICHMENT_PROMPT | self.llm
@@ -177,9 +180,3 @@ class ThreatDetectionAgent(BaseSecurityAgent):
         }
 
 
-async def lookup_virustotal_safe(ioc: str) -> str | None:
-    try:
-        from core.tools.threat_tools import lookup_virustotal
-        return await lookup_virustotal.ainvoke({"ioc": ioc})
-    except Exception:
-        return None

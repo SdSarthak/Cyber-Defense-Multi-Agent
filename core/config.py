@@ -71,12 +71,6 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
 
-    # Threat Intel APIs
-    shodan_api_key: str = ""
-    virustotal_api_key: str = ""
-    abuseipdb_api_key: str = ""
-    otxalienvault_api_key: str = ""
-
     # Agent Config
     agent_max_iterations: int = 10
     agent_timeout_seconds: int = 120

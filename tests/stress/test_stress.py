@@ -209,9 +209,9 @@ class TestSupervisorStress:
         monkeypatch.setattr("core.rag.rag_chain.vuln_rag", AsyncMock(return_value=""))
         monkeypatch.setattr("core.rag.rag_chain.compliance_rag", AsyncMock(return_value=""))
         monkeypatch.setattr("core.tools.threat_tools.get_nvd_cve", AsyncMock(return_value='{"error": "mocked"}'))
-        monkeypatch.setattr("core.tools.threat_tools.search_shodan", AsyncMock(return_value='{"results": []}'))
-        monkeypatch.setattr("core.tools.threat_tools.lookup_ip_reputation", AsyncMock(return_value='{}'))
-        monkeypatch.setattr("core.tools.threat_tools.lookup_virustotal", AsyncMock(return_value='{}'))
+        monkeypatch.setattr("core.tools.threat_tools.scan_asset_ports", AsyncMock(return_value='{"open_ports":[],"exposed_services":[],"risk_level":"low"}'))
+        monkeypatch.setattr("core.tools.threat_tools.enrich_ip", AsyncMock(return_value='{"risk_score":0}'))
+        monkeypatch.setattr("core.tools.threat_tools.score_ioc", AsyncMock(return_value='{"risk_score":0}'))
 
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             llm = make_fast_llm({
