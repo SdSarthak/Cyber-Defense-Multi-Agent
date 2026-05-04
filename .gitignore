@@ -1,26 +1,82 @@
+# ─── Secrets ──────────────────────────────────────────────────────────────────
 .env
-/.env
-# Ignore node_modules
-/node_modules
-# Ignore build output
-/dist
-# Ignore logs
-/logs
-# Ignore OS files
-.DS_Store
-# Ignore IDE files
-/.idea
-# Ignore npm debug files
+*.key
+*.pem
+*.p12
+secrets/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-wheel-metadata/
+
+# ─── Virtual environments ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ─── Testing / coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# ─── Node / React dashboard ───────────────────────────────────────────────────
+dashboard/node_modules/
+dashboard/build/
+dashboard/.env.local
+dashboard/.env.development.local
+dashboard/.env.test.local
+dashboard/.env.production.local
 npm-debug.log*
-# Ignore yarn debug files
 yarn-debug.log*
+yarn-error.log*
 
-/.pycache
-.pycache/
-# Ignore Python virtual environment
-/venv
-# Ignore Jupyter Notebook checkpoints
-.ipynb_checkpoints
-# Ignore compiled Python files
-*.pyc
+# ─── Docker ───────────────────────────────────────────────────────────────────
+docker-compose.override.yml
 
+# ─── Data / volumes ───────────────────────────────────────────────────────────
+postgres_data/
+redis_data/
+es_data/
+chroma_data/
+prometheus_data/
+grafana_data/
+*.db
+*.sqlite3
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── ML model cache ───────────────────────────────────────────────────────────
+.cache/
+models/
+sentence_transformers/
+huggingface/
+
+# ─── IDE / OS ─────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Alembic ──────────────────────────────────────────────────────────────────
+alembic/versions/*.pyc
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
