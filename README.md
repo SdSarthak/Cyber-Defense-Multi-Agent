@@ -93,6 +93,18 @@ cp .env.example .env
 docker-compose up -d
 ```
 
+### 4. Run database migrations
+
+```bash
+alembic upgrade head
+```
+
+### 5. Seed the vector store (RAG knowledge base)
+
+```bash
+python scripts/seed_vector_store.py
+```
+
 Services started:
 
 | Service | URL |
@@ -163,6 +175,25 @@ python -m simulation.engine
 ---
 
 ## API Reference
+
+### Authentication
+
+All `/api/v1/*` routes require a JWT bearer token. Get one first:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}'
+# Returns: {"access_token": "...", "token_type": "bearer"}
+```
+
+Then include it in all requests:
+```bash
+curl http://localhost:8000/api/v1/agents/status \
+  -H "Authorization: Bearer <token>"
+```
+
+Default credentials: `admin / admin123` or `analyst / analyst123`.
 
 ### Agents
 | Method | Endpoint | Description |

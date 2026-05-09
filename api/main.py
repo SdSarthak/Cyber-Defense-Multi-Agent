@@ -2,12 +2,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_client import make_asgi_app
 
 from core.config import settings
 from core.database.base import init_db
 from core.database.redis_client import get_redis
-from api.routes import agents, incidents, threats, vulnerabilities, compliance, reports, health
+from api.routes import agents, incidents, threats, vulnerabilities, compliance, reports, health, auth
 from api.websocket.manager import ws_router
 from api.middleware.auth import AuthMiddleware
 
@@ -42,6 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(BaseHTTPMiddleware, dispatch=AuthMiddleware())
 
 # Prometheus metrics endpoint
 metrics_app = make_asgi_app()
@@ -49,6 +51,7 @@ app.mount("/metrics", metrics_app)
 
 # Routers
 app.include_router(health.router, tags=["health"])
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(agents.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(incidents.router, prefix="/api/v1/incidents", tags=["incidents"])
 app.include_router(threats.router, prefix="/api/v1/threats", tags=["threats"])
