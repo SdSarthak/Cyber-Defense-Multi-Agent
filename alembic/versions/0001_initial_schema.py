@@ -14,17 +14,25 @@ down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+severity_enum = sa.Enum("critical", "high", "medium", "low", "info", name="severitylevel")
+incident_status_enum = sa.Enum("open", "investigating", "contained", "resolved", "false_positive", name="incidentstatus")
+agent_status_enum = sa.Enum("idle", "running", "error", "disabled", name="agentstatus")
+
 
 def upgrade() -> None:
     op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+
+    severity_enum.create(op.get_bind(), checkfirst=True)
+    incident_status_enum.create(op.get_bind(), checkfirst=True)
+    agent_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "incidents",
         sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("title", sa.String(255), nullable=False),
         sa.Column("description", sa.Text),
-        sa.Column("severity", sa.String(20), nullable=False, server_default="medium"),
-        sa.Column("status", sa.String(50), nullable=False, server_default="open"),
+        sa.Column("severity", severity_enum, nullable=False, server_default="medium"),
+        sa.Column("status", incident_status_enum, nullable=False, server_default="open"),
         sa.Column("assigned_agent", sa.String(100)),
         sa.Column("playbook_used", sa.String(100)),
         sa.Column("timeline", JSON),
@@ -46,7 +54,7 @@ def upgrade() -> None:
         sa.Column("destination_port", sa.Integer),
         sa.Column("protocol", sa.String(20)),
         sa.Column("threat_type", sa.String(100), nullable=False),
-        sa.Column("severity", sa.String(20), nullable=False, server_default="medium"),
+        sa.Column("severity", severity_enum, nullable=False, server_default="medium"),
         sa.Column("confidence_score", sa.Float, server_default="0.0"),
         sa.Column("raw_log", sa.Text),
         sa.Column("enrichment_data", JSON),
@@ -69,7 +77,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text),
         sa.Column("cvss_score", sa.Float),
         sa.Column("cvss_vector", sa.String(100)),
-        sa.Column("severity", sa.String(20), nullable=False, server_default="medium"),
+        sa.Column("severity", severity_enum, nullable=False, server_default="medium"),
         sa.Column("affected_products", JSON),
         sa.Column("patch_available", sa.Boolean, server_default="false"),
         sa.Column("patch_url", sa.Text),
@@ -102,7 +110,7 @@ def upgrade() -> None:
         sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
         sa.Column("agent_name", sa.String(100), unique=True, nullable=False),
         sa.Column("agent_type", sa.String(100), nullable=False),
-        sa.Column("status", sa.String(20), nullable=False, server_default="idle"),
+        sa.Column("status", agent_status_enum, nullable=False, server_default="idle"),
         sa.Column("last_heartbeat", sa.DateTime(timezone=True)),
         sa.Column("tasks_completed", sa.Integer, server_default="0"),
         sa.Column("tasks_failed", sa.Integer, server_default="0"),
@@ -169,3 +177,7 @@ def downgrade() -> None:
     op.drop_table("vulnerabilities")
     op.drop_table("threat_events")
     op.drop_table("incidents")
+
+    agent_status_enum.drop(op.get_bind(), checkfirst=True)
+    incident_status_enum.drop(op.get_bind(), checkfirst=True)
+    severity_enum.drop(op.get_bind(), checkfirst=True)

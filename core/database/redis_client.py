@@ -46,6 +46,10 @@ class RedisCache:
     async def lpush(self, key: str, value: Any) -> None:
         await self._redis.lpush(key, json.dumps(value, default=str))
 
+    async def rpop(self, key: str) -> Any | None:
+        raw = await self._redis.rpop(key)
+        return json.loads(raw) if raw else None
+
     async def lrange(self, key: str, start: int = 0, end: int = -1) -> list[Any]:
         items = await self._redis.lrange(key, start, end)
         return [json.loads(i) for i in items]

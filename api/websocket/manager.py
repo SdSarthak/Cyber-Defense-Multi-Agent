@@ -52,11 +52,6 @@ async def redis_listener():
                 pass
 
 
-@ws_router.on_event("startup")
-async def start_redis_listener():
-    asyncio.create_task(redis_listener())
-
-
 @ws_router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
