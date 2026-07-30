@@ -1,121 +1,127 @@
 """Unit tests for IncidentResponseAgent."""
-import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+
+from agents.incident_response.agent import PLAYBOOKS
+from tests.conftest import patch_llm
+
+IR_PLAN = {
+    "incident_id": "0d1b6d1e-1f5f-4a1a-9c62-2c9f3b6d5e77",
+    "playbook": "brute_force", "priority": "p1",
+    "containment_actions": [
+        {"action": "Block source IP at firewall", "automated": True, "status": "pending"},
+        {"action": "Reset compromised credentials", "automated": False, "status": "pending"},
+    ],
+    "investigation_steps": ["Review auth logs", "Check other hosts"],
+    "communication_plan": {"internal": "Notify SOC", "external": ""},
+    "timeline": [{"time": "T+0", "event": "Detection"}],
+    "estimated_resolution": "2h",
+    "lessons_learned": ["Enforce MFA"],
+}
 
 
-def _make_ir_llm():
-    resp = MagicMock()
-    resp.content = json.dumps({
-        "incident_id": "inc-001", "playbook": "brute_force", "priority": "p1",
-        "containment_actions": [
-            {"action": "Block source IP at firewall", "automated": True, "status": "pending"},
-            {"action": "Reset compromised credentials", "automated": False, "status": "pending"},
-        ],
-        "investigation_steps": ["Review auth logs", "Check other hosts"],
-        "communication_plan": {"internal": "Notify SOC", "external": ""},
-        "timeline": [{"time": "T+0", "event": "Detection"}],
-        "estimated_resolution": "2h",
-        "lessons_learned": ["Enforce MFA"],
-    })
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(return_value=resp)
-    return llm
+def build_agent(response=IR_PLAN):
+    from agents.incident_response.agent import IncidentResponseAgent
+    agent = IncidentResponseAgent()
+    with patch_llm(response):
+        _ = agent.llm
+    return agent
 
 
 @pytest.fixture
-def ir_agent(monkeypatch):
-    mock_cache = MagicMock()
-    mock_cache.set = AsyncMock()
-    mock_cache.get = AsyncMock(return_value=None)
-    mock_cache.hset = AsyncMock()
-    mock_cache.hgetall = AsyncMock(return_value={})
-    mock_cache.lpush = AsyncMock()
-    mock_cache.lrange = AsyncMock(return_value=[])
-    mock_cache.publish = AsyncMock()
-    mock_cache._redis = MagicMock()
-    mock_cache._redis.ltrim = AsyncMock()
-    monkeypatch.setattr("core.database.redis_client.cache", mock_cache)
-    monkeypatch.setattr("core.memory.agent_memory.cache", mock_cache)
-    with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
-        MockLLM.return_value = _make_ir_llm()
-        from agents.incident_response.agent import IncidentResponseAgent
-        return IncidentResponseAgent(), mock_cache
+def ir_agent(fake_cache):
+    return build_agent()
 
 
-@pytest.mark.asyncio
 async def test_ir_agent_basic_response(ir_agent):
-    agent, _ = ir_agent
-    result = await agent.run({
+    result = await ir_agent.run({
         "incident": {"title": "Brute force on SSH", "type": "brute_force"},
         "threat_assessment": {"threat_type": "brute_force", "severity": "high"},
     })
-    assert "response_plan" in result
-    assert "playbook_name" in result
     assert result["playbook_name"] == "brute_force"
+    assert result["response_plan"]["priority"] == "p1"
+    assert "summary" in result
 
 
-@pytest.mark.asyncio
-async def test_playbook_selection_brute_force(ir_agent):
-    agent, _ = ir_agent
-    result = await agent.run({
-        "incident": {"type": "brute_force"},
-        "threat_assessment": {"threat_type": "brute_force"},
+@pytest.mark.parametrize("threat_type,expected", [
+    ("brute_force", "brute_force"),
+    ("ransomware", "ransomware"),
+    ("data_exfiltration", "data_exfiltration"),
+    ("c2_beacon", "c2_beacon"),
+    ("sql_injection", "sql_injection"),
+    ("unknown_threat", "default"),
+])
+async def test_playbook_selection(ir_agent, threat_type, expected):
+    result = await ir_agent.run({
+        "incident": {"type": threat_type},
+        "threat_assessment": {"threat_type": threat_type},
     })
-    assert result["playbook_name"] == "brute_force"
+    assert result["playbook_name"] == expected
 
 
-@pytest.mark.asyncio
-async def test_playbook_selection_ransomware(ir_agent, monkeypatch):
-    agent, _ = ir_agent
-    result = await agent.run({
+async def test_playbook_falls_back_to_incident_type(ir_agent):
+    """With no threat assessment the incident's own type must still pick a playbook."""
+    result = await ir_agent.run({
         "incident": {"type": "ransomware"},
-        "threat_assessment": {"threat_type": "ransomware"},
+        "threat_assessment": {},
     })
     assert result["playbook_name"] == "ransomware"
 
 
-@pytest.mark.asyncio
-async def test_playbook_selection_default(ir_agent):
-    agent, _ = ir_agent
-    result = await agent.run({
-        "incident": {"type": "unknown_threat"},
+async def test_automated_actions_executed(ir_agent):
+    result = await ir_agent.run({
+        "incident": {"title": "Test"},
+        "threat_assessment": {"threat_type": "brute_force"},
+    })
+    automated = result["actions_taken"]
+    assert automated, "expected at least one automated containment action"
+    assert all(a["status"] == "completed" for a in automated)
+    # Manual steps are left for a human and must not be marked done.
+    manual = [
+        a for a in result["response_plan"]["containment_actions"] if not a.get("automated")
+    ]
+    assert all(a["status"] == "pending" for a in manual)
+
+
+async def test_incident_stored_in_redis(ir_agent, fake_cache):
+    result = await ir_agent.run({
+        "incident": {"title": "Test"},
         "threat_assessment": {},
     })
-    assert result["playbook_name"] == "default"
+    incident_id = result["incident_id"]
+    stored = await fake_cache.get(f"incident:{incident_id}")
+    assert stored["status"] == "investigating"
+    assert await fake_cache.llen("incidents:index") == 1
 
 
-@pytest.mark.asyncio
-async def test_automated_actions_executed(ir_agent):
-    agent, cache = ir_agent
+async def test_incident_update_published(ir_agent, fake_cache):
+    await ir_agent.run({"incident": {"title": "Test"}, "threat_assessment": {}})
+    updates = fake_cache.messages_on("incident_updates")
+    assert len(updates) == 1
+    assert updates[0]["agent"] == "incident_response"
+
+
+async def test_malformed_llm_response_uses_playbook_steps(fake_cache):
+    """When the model returns junk the agent must still emit the canned playbook."""
+    agent = build_agent("not json at all")
+    result = await agent.run({
+        "incident": {"title": "Test"},
+        "threat_assessment": {"threat_type": "ransomware"},
+    })
+    actions = [a["action"] for a in result["response_plan"]["containment_actions"]]
+    assert actions == PLAYBOOKS["ransomware"]
+    assert result["response_plan"]["priority"] == "p2"
+
+
+async def test_plan_without_containment_actions_is_backfilled(fake_cache):
+    agent = build_agent({"playbook": "brute_force", "priority": "p3"})
     result = await agent.run({
         "incident": {"title": "Test"},
         "threat_assessment": {"threat_type": "brute_force"},
     })
-    automated = [a for a in result.get("actions_taken", []) if a.get("automated")]
-    for a in automated:
-        assert a["status"] == "completed"
+    assert result["response_plan"]["containment_actions"]
+    assert result["response_plan"]["incident_id"]
 
 
-@pytest.mark.asyncio
-async def test_incident_stored_in_redis(ir_agent):
-    agent, cache = ir_agent
-    await agent.run({
-        "incident": {"id": "inc-001", "title": "Test"},
-        "threat_assessment": {},
-    })
-    cache.set.assert_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("incident_type", [
-    "brute_force", "ransomware", "data_exfiltration", "c2_beacon", "sql_injection", "unknown"
-])
-async def test_all_incident_types(ir_agent, incident_type):
-    agent, _ = ir_agent
-    result = await agent.run({
-        "incident": {"type": incident_type, "title": f"{incident_type} incident"},
-        "threat_assessment": {"threat_type": incident_type},
-    })
+async def test_non_dict_incident_is_tolerated(ir_agent):
+    result = await ir_agent.run({"incident": "just a string", "threat_assessment": {}})
     assert "response_plan" in result
-    assert "summary" in result

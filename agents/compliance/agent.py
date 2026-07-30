@@ -7,7 +7,9 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
-from core.rag.rag_chain import compliance_rag
+from core.rag import rag_chain
+from core.database import repository
+from core.parsing import parse_json_response
 
 FRAMEWORKS = {
     "SOC2": {
@@ -38,17 +40,24 @@ FRAMEWORKS = {
     },
 }
 
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 EVAL_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a compliance auditor. Evaluate the security control against evidence.
 Return JSON:
-{
+{{
   "status": "pass|fail|partial|na",
   "score": float (0-100),
   "findings": [str],
   "evidence_quality": "strong|moderate|weak|none",
   "remediation": str,
   "risk_if_failed": "critical|high|medium|low"
-}
+}}
 Return ONLY valid JSON."""),
     ("human", "Framework: {framework}\nControl: {control_id} - {control_name}\nEvidence:\n{evidence}\nPolicy context:\n{policy_context}"),
 ])
@@ -86,29 +95,24 @@ class ComplianceAgent(BaseSecurityAgent):
     async def _evaluate_controls(self, state: ComplianceState) -> dict:
         framework = state["framework"]
         controls = FRAMEWORKS.get(framework, {})
-        evidence = state["evidence"]
+        evidence = state["evidence"] if isinstance(state["evidence"], dict) else {}
         results = []
         for control_id, control_name in controls.items():
-            policy_ctx = ""
-            try:
-                policy_ctx = await compliance_rag.ainvoke(
-                    f"{framework} {control_id} {control_name} compliance requirements"
-                )
-            except Exception:
-                pass
+            policy_ctx = await rag_chain.compliance_rag.ainvoke(
+                f"{framework} {control_id} {control_name} compliance requirements"
+            )
 
             chain = EVAL_PROMPT | self.llm
             resp = await chain.ainvoke({
                 "framework": framework,
                 "control_id": control_id,
                 "control_name": control_name,
-                "evidence": json.dumps(evidence.get(control_id, {})),
+                "evidence": json.dumps(evidence.get(control_id, {}), default=str),
                 "policy_context": policy_ctx,
             })
-            try:
-                result = json.loads(resp.content)
-            except Exception:
-                result = {"status": "partial", "score": 50.0, "findings": [], "remediation": ""}
+            result = parse_json_response(resp.content) or {
+                "status": "partial", "score": 50.0, "findings": [], "remediation": "",
+            }
             result["control_id"] = control_id
             result["control_name"] = control_name
             results.append(result)
@@ -120,8 +124,12 @@ class ComplianceAgent(BaseSecurityAgent):
     async def _score_framework(self, state: ComplianceState) -> dict:
         results = state["control_results"]
         if not results:
-            return {"overall_score": 0.0, "failed_controls": []}
-        scores = [r.get("score", 0) for r in results]
+            return {
+                "overall_score": 0.0,
+                "failed_controls": [],
+                "messages": [AIMessage(content="No controls defined for this framework")],
+            }
+        scores = [_as_float(r.get("score")) for r in results]
         overall = sum(scores) / len(scores)
         failed = [r["control_id"] for r in results if r.get("status") == "fail"]
         return {
@@ -135,6 +143,19 @@ class ComplianceAgent(BaseSecurityAgent):
             r for r in state["control_results"]
             if r.get("status") == "fail" and r.get("risk_if_failed") in ("critical", "high")
         ]
+
+        # Persist the control-by-control verdict so posture can be trended over time.
+        await repository.save_compliance_results(state["framework"], state["control_results"])
+
+        if critical_failures:
+            await self.escalate({
+                "type": "compliance_gap",
+                "severity": "high",
+                "framework": state["framework"],
+                "failed_controls": [r.get("control_id") for r in critical_failures],
+                "overall_score": state["overall_score"],
+            })
+
         summary = (
             f"{state['framework']} compliance: {state['overall_score']}% | "
             f"Failed controls: {len(state['failed_controls'])} | "
@@ -145,6 +166,14 @@ class ComplianceAgent(BaseSecurityAgent):
     async def run(self, input_data: dict) -> dict:
         framework = input_data.get("framework", "SOC2")
         evidence = input_data.get("evidence", {})
+        if framework not in FRAMEWORKS:
+            return {
+                "framework": framework,
+                "control_results": [],
+                "overall_score": 0.0,
+                "failed_controls": [],
+                "summary": f"Unsupported framework '{framework}'. Supported: {sorted(FRAMEWORKS)}",
+            }
         initial: ComplianceState = {
             "messages": [HumanMessage(content=f"Evaluate {framework} compliance")],
             "framework": framework,

@@ -1,11 +1,12 @@
 """Supervisor Agent — LangGraph orchestrator that routes tasks to specialist agents."""
 from __future__ import annotations
-import json
 import asyncio
+import hashlib
+import json
 from typing import TypedDict, Annotated, Literal
 import operator
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
 from agents.threat_detection.agent import ThreatDetectionAgent
@@ -14,8 +15,11 @@ from agents.vulnerability_intel.agent import VulnerabilityIntelAgent
 from agents.incident_response.agent import IncidentResponseAgent
 from agents.compliance.agent import ComplianceAgent
 from agents.reporting.agent import ReportingAgent
-from core.database.redis_client import cache
+from core import metrics
+from core.config import settings
+from core.database import redis_client
 from core.memory.agent_memory import AgentMemory
+from core.parsing import parse_json_response
 
 ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are the SOC Supervisor Agent. Analyse the incoming task and decide which specialist agents to invoke.
@@ -30,12 +34,12 @@ Available agents:
 - all: Invoke all agents (for full security assessment)
 
 Return JSON:
-{
+{{
   "agents": ["agent1", "agent2"],
   "reasoning": str,
   "priority": "immediate|high|normal|low",
   "parallel": bool
-}
+}}
 Return ONLY valid JSON."""),
     ("human", "Task:\n{task}\n\nCurrent threat level from blackboard:\n{threat_level}"),
 ])
@@ -44,6 +48,13 @@ AgentName = Literal[
     "threat_detection", "log_analysis", "vulnerability_intel",
     "incident_response", "compliance", "reporting"
 ]
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class SupervisorState(TypedDict):
@@ -86,19 +97,32 @@ class SupervisorAgent(BaseSecurityAgent):
         threat_level = await AgentMemory.blackboard_get("threat_level") or "normal"
         chain = ROUTER_PROMPT | self.llm
         resp = await chain.ainvoke({
-            "task": json.dumps(state["task"]),
+            "task": json.dumps(state["task"], default=str),
             "threat_level": threat_level,
         })
-        try:
-            decision = json.loads(resp.content)
-        except json.JSONDecodeError:
-            decision = {"agents": ["threat_detection"], "reasoning": "parse error fallback",
-                        "priority": "normal", "parallel": False}
+        decision = parse_json_response(resp.content) or {
+            "agents": ["threat_detection"], "reasoning": "parse error fallback",
+            "priority": "normal", "parallel": False,
+        }
 
-        if "all" in decision.get("agents", []):
-            decision["agents"] = list(self._agents.keys())
+        agents = decision.get("agents") or []
+        if not isinstance(agents, list):
+            agents = [str(agents)]
+        if "all" in agents:
+            agents = list(self._agents.keys())
 
-        await cache.publish("agent_events", {
+        # Drop hallucinated agent names before dispatch so a bad routing decision
+        # degrades to "nothing to do" instead of a KeyError mid-run.
+        known = [a for a in agents if a in self._agents]
+        if not known:
+            known = ["threat_detection"]
+            decision["reasoning"] = (
+                f"{decision.get('reasoning', '')} | no known agents in routing decision, "
+                f"defaulted to threat_detection"
+            ).strip(" |")
+        decision["agents"] = known
+
+        await self._safe_publish("agent_events", {
             "agent": self.name,
             "event": "routing_decision",
             "decision": decision,
@@ -110,35 +134,39 @@ class SupervisorAgent(BaseSecurityAgent):
 
     async def _dispatch(self, state: SupervisorState) -> dict:
         decision = state["routing_decision"]
-        agents_to_run = decision.get("agents", [])
+        agents_to_run = [n for n in decision.get("agents", []) if n in self._agents]
         parallel = decision.get("parallel", True)
         results: dict[str, dict] = {}
 
         if parallel:
-            tasks = {
-                name: asyncio.create_task(
-                    self._run_agent(name, state["task"])
-                )
-                for name in agents_to_run
-                if name in self._agents
-            }
-            for name, task in tasks.items():
-                try:
-                    results[name] = await task
-                except Exception as e:
-                    results[name] = {"error": str(e), "summary": f"Agent {name} failed: {e}"}
+            gathered = await asyncio.gather(
+                *(self._run_agent(name, state["task"]) for name in agents_to_run),
+                return_exceptions=True,
+            )
+            for name, outcome in zip(agents_to_run, gathered):
+                if isinstance(outcome, BaseException):
+                    results[name] = {"error": str(outcome), "summary": f"Agent {name} failed: {outcome}"}
+                else:
+                    results[name] = outcome
         else:
             for name in agents_to_run:
-                if name in self._agents:
-                    try:
-                        results[name] = await self._run_agent(name, state["task"])
-                    except Exception as e:
-                        results[name] = {"error": str(e)}
+                try:
+                    results[name] = await self._run_agent(name, state["task"])
+                except Exception as e:
+                    results[name] = {"error": str(e), "summary": f"Agent {name} failed: {e}"}
 
-        await AgentMemory.blackboard_update("last_agent_results", results)
+        # Only summaries go on the blackboard — full results can be megabytes and the
+        # blackboard is read on every routing decision.
+        await AgentMemory.blackboard_update(
+            "last_agent_results",
+            {name: r.get("summary", "") for name, r in results.items()},
+        )
+        succeeded = sum(1 for r in results.values() if "error" not in r)
         return {
             "agent_results": results,
-            "messages": [AIMessage(content=f"Dispatched {len(results)} agents, received {len(results)} results")],
+            "messages": [AIMessage(
+                content=f"Dispatched {len(agents_to_run)} agents, {succeeded} succeeded"
+            )],
         }
 
     async def _synthesise(self, state: SupervisorState) -> dict:
@@ -146,21 +174,33 @@ class SupervisorAgent(BaseSecurityAgent):
         summaries = [f"[{name}] {r.get('summary', 'no summary')}" for name, r in results.items()]
 
         # Determine overall threat level from results
-        severities = []
+        severities: list[str] = []
         for r in results.values():
-            if "severity" in r:
-                severities.append(r["severity"])
-            if "risk_reports" in r:
-                for rr in r["risk_reports"]:
-                    if rr.get("risk_score", 0) >= 9:
-                        severities.append("critical")
-                    elif rr.get("risk_score", 0) >= 7:
-                        severities.append("high")
+            severity = r.get("severity")
+            if isinstance(severity, str):
+                severities.append(severity.lower())
+            for rr in r.get("risk_reports") or []:
+                score = _as_float(rr.get("risk_score"))
+                if score >= 9:
+                    severities.append("critical")
+                elif score >= 7:
+                    severities.append("high")
+            for anomaly in r.get("anomalies") or []:
+                anomaly_severity = str(anomaly.get("severity", "")).lower()
+                if anomaly_severity in ("critical", "high"):
+                    severities.append(anomaly_severity)
 
-        threat_level = "critical" if "critical" in severities else (
-            "high" if "high" in severities else "medium" if severities else "low"
+        actionable = [s for s in severities if s in ("critical", "high", "medium", "low")]
+        threat_level = "critical" if "critical" in actionable else (
+            "high" if "high" in actionable
+            else "medium" if "medium" in actionable
+            else "low"
         )
         await AgentMemory.blackboard_set("threat_level", threat_level, ttl=3600)
+        metrics.set_threat_level(threat_level)
+        await self._safe_publish("agent_events", {
+            "agent": self.name, "event": "threat_level", "threat_level": threat_level,
+        })
 
         # If threat is high/critical, request a report
         if threat_level in ("critical", "high") and "reporting" not in results:
@@ -188,13 +228,17 @@ class SupervisorAgent(BaseSecurityAgent):
         }
 
     async def _run_agent(self, name: str, task: dict) -> dict:
-        agent = self._agents[name]
-        result = await agent._run_with_telemetry(task)
-        return result
+        if name not in self._agents:
+            raise KeyError(f"Unknown agent: {name}")
+        return await self._agents[name]._run_with_telemetry(task)
+
+    @property
+    def agent_names(self) -> list[str]:
+        return list(self._agents.keys())
 
     async def run(self, input_data: dict) -> dict:
         initial: SupervisorState = {
-            "messages": [HumanMessage(content=f"SOC task: {json.dumps(input_data)[:300]}")],
+            "messages": [HumanMessage(content=f"SOC task: {json.dumps(input_data, default=str)[:300]}")],
             "task": input_data,
             "routing_decision": {},
             "agent_results": {},
@@ -209,17 +253,97 @@ class SupervisorAgent(BaseSecurityAgent):
             "summary": final["summary"],
         }
 
-    async def handle_escalation(self, escalation: dict) -> None:
-        """Called when an agent publishes to the escalations Redis channel."""
-        await cache.publish("agent_events", {
+    # ── Escalation handling ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _escalation_key(escalation: dict) -> str:
+        """
+        Stable fingerprint for an escalation, used to suppress duplicate responses
+        while the same attack keeps firing.
+        """
+        event = escalation.get("event") or {}
+        parts = [
+            str(escalation.get("agent", "")),
+            str(escalation.get("threat_type") or escalation.get("type") or ""),
+            str(escalation.get("cve_id") or ""),
+            str(event.get("source_ip") or (event.get("parsed_fields") or {}).get("src_ip") or ""),
+        ]
+        digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        return f"escalation_seen:{digest}"
+
+    async def handle_escalation(self, escalation: dict) -> dict | None:
+        """
+        Called when an agent publishes to the `escalations` Redis channel.
+
+        Escalations are dispatched straight to the incident-response playbook rather
+        than back through the LLM router. Routing an escalation raised *by* the threat
+        detection agent back *into* the threat detection agent would re-raise the same
+        escalation forever; this path is deliberately acyclic. A Redis-backed cooldown
+        additionally collapses repeat escalations for the same source into one response.
+        """
+        if not settings.escalation_auto_response:
+            return None
+
+        await self._safe_publish("agent_events", {
             "agent": self.name,
             "event": "escalation_received",
             "escalation": escalation,
         })
-        task = {
-            "type": "escalation",
-            "source_agent": escalation.get("agent"),
-            "severity": escalation.get("severity", "high"),
-            **escalation,
+
+        # Cooldown: SET NX means exactly one worker responds per fingerprint per window.
+        key = self._escalation_key(escalation)
+        try:
+            first = await redis_client.cache.set_if_absent(
+                key, {"ts": escalation.get("severity")}, ttl=settings.escalation_cooldown_seconds
+            )
+        except Exception:
+            first = True
+        if not first:
+            return None
+
+        severity = str(escalation.get("severity", "high")).lower()
+        threat_type = escalation.get("threat_type") or escalation.get("type") or "unknown"
+        event = escalation.get("event") or {}
+
+        incident = {
+            "title": f"{str(threat_type).replace('_', ' ').title()} escalated by {escalation.get('agent', 'agent')}",
+            "type": threat_type,
+            "severity": severity,
+            "description": escalation.get("reasoning") or json.dumps(escalation, default=str)[:1000],
+            "affected_assets": [a for a in (
+                event.get("destination_ip"), event.get("source_ip"),
+            ) if a],
         }
-        await self._run_with_telemetry(task)
+        task = {
+            "incident": incident,
+            "threat_assessment": escalation.get("assessment") or {"threat_type": threat_type,
+                                                                  "severity": severity},
+        }
+
+        results: dict[str, dict] = {}
+        try:
+            results["incident_response"] = await self._run_agent("incident_response", task)
+        except Exception as exc:
+            results["incident_response"] = {"error": str(exc)}
+
+        # Critical escalations also get an immediate threat brief for the analyst.
+        if severity == "critical":
+            try:
+                results["reporting"] = await self._run_agent("reporting", {
+                    "report_type": "threat",
+                    "escalation": escalation,
+                    "incident": incident,
+                })
+            except Exception as exc:
+                results["reporting"] = {"error": str(exc)}
+
+        await AgentMemory.blackboard_set("threat_level", severity, ttl=3600)
+        metrics.set_threat_level(severity)
+        await self._safe_publish("agent_events", {
+            "agent": self.name,
+            "event": "escalation_handled",
+            "threat_type": threat_type,
+            "severity": severity,
+            "agents_run": list(results.keys()),
+        })
+        return results

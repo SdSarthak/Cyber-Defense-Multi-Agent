@@ -5,6 +5,7 @@ from core.database.models import (
     SeverityLevel, IncidentStatus, AgentStatus,
 )
 from core.database.redis_client import cache, get_redis
+from core.database import repository, es_client
 
 __all__ = [
     "Base", "get_db", "init_db", "engine", "AsyncSessionLocal",
@@ -12,4 +13,5 @@ __all__ = [
     "AgentRegistry", "AgentAction", "LogEntry",
     "SeverityLevel", "IncidentStatus", "AgentStatus",
     "cache", "get_redis",
+    "repository", "es_client",
 ]

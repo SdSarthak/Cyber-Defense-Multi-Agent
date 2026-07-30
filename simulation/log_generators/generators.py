@@ -16,6 +16,15 @@ HTTP_PATHS = ["/", "/admin", "/login", "/api/v1/users", "/wp-admin", "/.env", "/
 HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 HTTP_STATUS = [200, 200, 200, 301, 302, 400, 401, 403, 404, 500, 503]
 
+# (payload, attack_type) — the type matches LOG_PATTERNS in the log-analysis agent.
+WEB_ATTACK_PAYLOADS = [
+    ("/?id=1' UNION SELECT * FROM users--", "sql_injection"),
+    ("/admin?cmd=ls+-la;id", "command_injection"),
+    ("/<script>alert(1)</script>", "xss"),
+    ("/../../../etc/passwd", "path_traversal"),
+    ("/login?user=admin&pass=' OR '1'='1", "sql_injection"),
+]
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -51,24 +60,24 @@ def make_brute_force_log(target_ip: str | None = None) -> dict:
 def make_web_log(attack: bool = False) -> dict:
     ip = _src_ip(attack)
     method = random.choice(HTTP_METHODS)
+    attack_type = None
     if attack:
-        path = random.choice([
-            "/?id=1' UNION SELECT * FROM users--",
-            "/admin?cmd=ls+-la",
-            "/<script>alert(1)</script>",
-            "/../../../etc/passwd",
-            "/login?user=admin&pass=' OR '1'='1",
-        ])
+        # Every attack payload is labelled with the technique it represents so
+        # downstream analysis can key on parsed_fields["attack_type"] uniformly.
+        path, attack_type = random.choice(WEB_ATTACK_PAYLOADS)
         status = random.choice([200, 400, 403, 500])
     else:
         path = random.choice(HTTP_PATHS)
         status = random.choice(HTTP_STATUS)
     msg = f'{ip} - - [{_ts()}] "{method} {path} HTTP/1.1" {status} {random.randint(100,50000)}'
+    parsed = {"src_ip": ip, "method": method, "path": path,
+              "status": status, "attack": attack}
+    if attack_type:
+        parsed["attack_type"] = attack_type
     return {"id": str(uuid.uuid4()), "timestamp": _ts(), "source": "nginx",
             "log_level": "INFO" if status < 400 else "WARNING", "message": msg,
             "host": random.choice(INTERNAL_IPS), "service": "nginx",
-            "parsed_fields": {"src_ip": ip, "method": method, "path": path,
-                              "status": status, "attack": attack}}
+            "parsed_fields": parsed}
 
 
 def make_port_scan_log(attacker_ip: str | None = None) -> dict:

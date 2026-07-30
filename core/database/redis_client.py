@@ -21,6 +21,16 @@ def get_redis() -> aioredis.Redis:
     return aioredis.Redis(connection_pool=get_redis_pool())
 
 
+def _loads(raw: Any) -> Any:
+    """Tolerate values written to Redis by other producers as plain strings."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+
 class RedisCache:
     """Typed Redis wrapper used by agents for short-term task memory."""
 
@@ -31,14 +41,16 @@ class RedisCache:
         await self._redis.setex(key, ttl, json.dumps(value, default=str))
 
     async def get(self, key: str) -> Any | None:
-        raw = await self._redis.get(key)
-        return json.loads(raw) if raw else None
+        return _loads(await self._redis.get(key))
 
     async def delete(self, key: str) -> None:
         await self._redis.delete(key)
 
     async def exists(self, key: str) -> bool:
         return bool(await self._redis.exists(key))
+
+    async def expire(self, key: str, ttl: int) -> None:
+        await self._redis.expire(key, ttl)
 
     async def publish(self, channel: str, message: Any) -> None:
         await self._redis.publish(channel, json.dumps(message, default=str))
@@ -47,22 +59,31 @@ class RedisCache:
         await self._redis.lpush(key, json.dumps(value, default=str))
 
     async def rpop(self, key: str) -> Any | None:
-        raw = await self._redis.rpop(key)
-        return json.loads(raw) if raw else None
+        return _loads(await self._redis.rpop(key))
 
     async def lrange(self, key: str, start: int = 0, end: int = -1) -> list[Any]:
         items = await self._redis.lrange(key, start, end)
-        return [json.loads(i) for i in items]
+        return [_loads(i) for i in items]
+
+    async def ltrim(self, key: str, start: int, end: int) -> None:
+        await self._redis.ltrim(key, start, end)
+
+    async def llen(self, key: str) -> int:
+        return int(await self._redis.llen(key))
 
     async def incr(self, key: str) -> int:
         return await self._redis.incr(key)
+
+    async def set_if_absent(self, key: str, value: Any, ttl: int) -> bool:
+        """SET NX EX — returns True when the caller won the race (used for cooldowns)."""
+        return bool(await self._redis.set(key, json.dumps(value, default=str), ex=ttl, nx=True))
 
     async def hset(self, name: str, mapping: dict) -> None:
         await self._redis.hset(name, mapping={k: json.dumps(v, default=str) for k, v in mapping.items()})
 
     async def hgetall(self, name: str) -> dict:
         raw = await self._redis.hgetall(name)
-        return {k: json.loads(v) for k, v in raw.items()}
+        return {k: _loads(v) for k, v in raw.items()}
 
 
 cache = RedisCache()

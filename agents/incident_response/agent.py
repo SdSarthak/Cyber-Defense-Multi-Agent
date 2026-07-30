@@ -8,8 +8,9 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
-from core.database.redis_client import cache
-from core.memory.agent_memory import AgentMemory
+from core import metrics
+from core.database import redis_client, repository
+from core.parsing import parse_json_response
 
 PLAYBOOKS = {
     "brute_force": [
@@ -60,17 +61,17 @@ PLAYBOOKS = {
 RESPONSE_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are an incident response coordinator. Given the incident details and playbook steps,
 generate a detailed response plan as JSON:
-{
+{{
   "incident_id": str,
   "playbook": str,
   "priority": "p1|p2|p3|p4",
-  "containment_actions": [{"action": str, "automated": bool, "status": "pending"}],
+  "containment_actions": [{{"action": str, "automated": bool, "status": "pending"}}],
   "investigation_steps": [str],
-  "communication_plan": {"internal": str, "external": str},
-  "timeline": [{"time": str, "event": str}],
+  "communication_plan": {{"internal": str, "external": str}},
+  "timeline": [{{"time": str, "event": str}}],
   "estimated_resolution": str,
   "lessons_learned": [str]
-}
+}}
 Return ONLY valid JSON."""),
     ("human", "Incident:\n{incident}\n\nPlaybook steps:\n{playbook_steps}\n\nThreat assessment:\n{assessment}"),
 ])
@@ -83,6 +84,7 @@ class IRState(TypedDict):
     playbook_name: str
     response_plan: dict
     actions_taken: list[dict]
+    incident_id: str | None
     summary: str
 
 
@@ -108,13 +110,16 @@ class IncidentResponseAgent(BaseSecurityAgent):
         return graph.compile()
 
     async def _select_playbook(self, state: IRState) -> dict:
-        threat_type = (
-            state["threat_assessment"].get("threat_type", "")
-            or state["incident"].get("type", "default")
+        assessment = state["threat_assessment"] if isinstance(state["threat_assessment"], dict) else {}
+        incident = state["incident"] if isinstance(state["incident"], dict) else {}
+        threat_type = str(
+            assessment.get("threat_type") or incident.get("type") or "default"
         ).lower()
+
+        # Longest match first so "sql_injection" is not shadowed by a shorter key.
         playbook_name = "default"
-        for key in PLAYBOOKS:
-            if key in threat_type:
+        for key in sorted(PLAYBOOKS, key=len, reverse=True):
+            if key != "default" and key in threat_type:
                 playbook_name = key
                 break
         return {
@@ -126,38 +131,49 @@ class IncidentResponseAgent(BaseSecurityAgent):
         playbook_steps = PLAYBOOKS.get(state["playbook_name"], PLAYBOOKS["default"])
         chain = RESPONSE_PROMPT | self.llm
         resp = await chain.ainvoke({
-            "incident": json.dumps(state["incident"]),
+            "incident": json.dumps(state["incident"], default=str),
             "playbook_steps": json.dumps(playbook_steps),
-            "assessment": json.dumps(state["threat_assessment"]),
+            "assessment": json.dumps(state["threat_assessment"], default=str),
         })
-        try:
-            plan = json.loads(resp.content)
-            if not plan.get("incident_id"):
-                plan["incident_id"] = state["incident"].get("id", str(uuid.uuid4()))
-        except json.JSONDecodeError:
+
+        fallback_id = state["incident"].get("id") or str(uuid.uuid4())
+        plan = parse_json_response(resp.content)
+        if plan is None:
             plan = {
-                "incident_id": state["incident"].get("id", str(uuid.uuid4())),
+                "incident_id": fallback_id,
                 "playbook": state["playbook_name"],
                 "priority": "p2",
-                "containment_actions": [{"action": s, "automated": False, "status": "pending"} for s in playbook_steps],
+                "containment_actions": [
+                    {"action": s, "automated": False, "status": "pending"} for s in playbook_steps
+                ],
                 "investigation_steps": [],
                 "communication_plan": {},
                 "timeline": [],
                 "estimated_resolution": "TBD",
                 "lessons_learned": [],
             }
+        else:
+            plan.setdefault("playbook", state["playbook_name"])
+            if not plan.get("incident_id"):
+                plan["incident_id"] = fallback_id
+            if not plan.get("containment_actions"):
+                plan["containment_actions"] = [
+                    {"action": s, "automated": False, "status": "pending"} for s in playbook_steps
+                ]
+
+        metrics.incidents_total.labels(playbook=str(plan.get("playbook", "default"))).inc()
         return {"response_plan": plan,
                 "messages": [AIMessage(content=f"Response plan built: {plan.get('priority')} priority")]}
 
     async def _execute_containment(self, state: IRState) -> dict:
         actions_taken = []
         for action in state["response_plan"].get("containment_actions", []):
-            if action.get("automated"):
-                result = await self._simulate_action(action["action"], state["incident"])
+            if isinstance(action, dict) and action.get("automated"):
+                result = await self._simulate_action(str(action.get("action", "")), state["incident"])
                 action["status"] = "completed" if result["success"] else "failed"
                 action["result"] = result
                 actions_taken.append(action)
-        await cache.publish("incident_updates", {
+        await self._safe_publish("incident_updates", {
             "agent": self.name,
             "incident_id": state["response_plan"].get("incident_id"),
             "actions_taken": len(actions_taken),
@@ -167,22 +183,40 @@ class IncidentResponseAgent(BaseSecurityAgent):
                 "messages": [AIMessage(content=f"Executed {len(actions_taken)} automated containment actions")]}
 
     async def _update_incident(self, state: IRState) -> dict:
-        await cache.set(
-            f"incident:{state['response_plan'].get('incident_id')}",
-            {
-                "response_plan": state["response_plan"],
-                "actions_taken": state["actions_taken"],
-                "status": "investigating",
-            },
-            ttl=86400,
-        )
+        plan = state["response_plan"]
+
+        # PostgreSQL is the durable record; the Redis copy backs the live dashboard.
+        db_id = await repository.save_incident(state["incident"], plan, state["actions_taken"])
+        incident_id = db_id or plan.get("incident_id")
+        plan["incident_id"] = incident_id
+
+        record = {
+            "incident_id": incident_id,
+            "response_plan": plan,
+            "actions_taken": state["actions_taken"],
+            "playbook": state["playbook_name"],
+            "status": "investigating",
+        }
+        try:
+            await redis_client.cache.set(f"incident:{incident_id}", record, ttl=86400)
+            await redis_client.cache.lpush("incidents:index", {
+                "incident_id": incident_id,
+                "playbook": state["playbook_name"],
+                "priority": plan.get("priority"),
+                "title": state["incident"].get("title", ""),
+            })
+            await redis_client.cache.ltrim("incidents:index", 0, 199)
+        except Exception:
+            pass
+
         summary = (
-            f"Incident {state['response_plan'].get('incident_id', 'N/A')} | "
+            f"Incident {incident_id or 'N/A'} | "
             f"Playbook: {state['playbook_name']} | "
-            f"Priority: {state['response_plan'].get('priority')} | "
+            f"Priority: {plan.get('priority')} | "
             f"Actions: {len(state['actions_taken'])} automated"
         )
-        return {"summary": summary, "messages": [AIMessage(content=summary)]}
+        return {"incident_id": incident_id, "summary": summary,
+                "messages": [AIMessage(content=summary)]}
 
     @staticmethod
     async def _simulate_action(action: str, incident: dict) -> dict:
@@ -190,15 +224,18 @@ class IncidentResponseAgent(BaseSecurityAgent):
         return {"success": True, "action": action, "note": "simulated"}
 
     async def run(self, input_data: dict) -> dict:
-        incident = input_data.get("incident", {})
-        threat_assessment = input_data.get("threat_assessment", {})
+        incident = input_data.get("incident") or {}
+        if not isinstance(incident, dict):
+            incident = {"title": str(incident)}
+        threat_assessment = input_data.get("threat_assessment") or {}
         initial: IRState = {
-            "messages": [HumanMessage(content=f"Respond to incident: {json.dumps(incident)[:200]}")],
+            "messages": [HumanMessage(content=f"Respond to incident: {json.dumps(incident, default=str)[:200]}")],
             "incident": incident,
             "threat_assessment": threat_assessment,
             "playbook_name": "default",
             "response_plan": {},
             "actions_taken": [],
+            "incident_id": None,
             "summary": "",
         }
         final = await self._graph.ainvoke(initial)
@@ -206,5 +243,6 @@ class IncidentResponseAgent(BaseSecurityAgent):
             "response_plan": final["response_plan"],
             "actions_taken": final["actions_taken"],
             "playbook_name": final["playbook_name"],
+            "incident_id": final.get("incident_id"),
             "summary": final["summary"],
         }

@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     elasticsearch_port: int = 9200
     elasticsearch_user: str = "elastic"
     elasticsearch_password: str = "elastic123"
+    elasticsearch_enabled: bool = True
+    elasticsearch_log_index: str = "cyberdefense-logs"
 
     @property
     def elasticsearch_url(self) -> str:
@@ -58,6 +60,7 @@ class Settings(BaseSettings):
     chroma_collection_threats: str = "threat_intel"
     chroma_collection_vulns: str = "vulnerability_kb"
     chroma_collection_compliance: str = "compliance_policies"
+    rag_enabled: bool = True
 
     # API
     api_host: str = "0.0.0.0"
@@ -71,6 +74,12 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
 
+    # Demo credentials — override in .env, or wire a real user store
+    admin_username: str = "admin"
+    admin_password: str = "admin123"
+    analyst_username: str = "analyst"
+    analyst_password: str = "analyst123"
+
     # Agent Config
     agent_max_iterations: int = 10
     agent_timeout_seconds: int = 120
@@ -78,10 +87,19 @@ class Settings(BaseSettings):
     log_analysis_batch_size: int = 100
     vuln_scan_interval: int = 3600
 
+    # Persistence
+    enable_persistence: bool = True
+
+    # Escalation handling
+    escalation_auto_response: bool = True
+    escalation_cooldown_seconds: int = 60
+
     # Simulation
     simulation_mode: bool = True
     simulation_log_rate: int = 10
     simulation_attack_probability: float = 0.05
+    simulation_consumer_enabled: bool = True
+    simulation_batch_size: int = 20
 
 
 @lru_cache

@@ -1,97 +1,104 @@
 """Unit tests for AgentMemory short-term + blackboard storage."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+
+from core.memory.agent_memory import HISTORY_LIMIT, AgentMemory
 
 
 @pytest.fixture
-def memory_with_mock():
-    store = {}
-    lists = {}
-    mock_cache = MagicMock()
-    mock_cache.set = AsyncMock(side_effect=lambda k, v, ttl=None: store.update({k: v}))
-    mock_cache.get = AsyncMock(side_effect=lambda k: store.get(k))
-    mock_cache.delete = AsyncMock(side_effect=lambda k: store.pop(k, None))
-    mock_cache.exists = AsyncMock(side_effect=lambda k: k in store)
-    mock_cache.lpush = AsyncMock(side_effect=lambda k, v: lists.setdefault(k, []).insert(0, v))
-    mock_cache.lrange = AsyncMock(side_effect=lambda k, s, e: lists.get(k, [])[s: None if e == -1 else e + 1])
-    mock_cache._redis = MagicMock()
-    mock_cache._redis.ltrim = AsyncMock()
-
-    with patch("core.memory.agent_memory.cache", mock_cache):
-        from core.memory.agent_memory import AgentMemory
-        return AgentMemory("test_agent"), store, lists
+def memory(fake_cache):
+    """AgentMemory backed by the autouse in-memory cache from conftest."""
+    return AgentMemory("test_agent")
 
 
-@pytest.mark.asyncio
-async def test_remember_and_recall(memory_with_mock):
-    mem, store, _ = memory_with_mock
-    await mem.remember("key1", {"value": 42})
-    result = await mem.recall("key1")
-    assert result == {"value": 42}
+async def test_remember_and_recall(memory):
+    await memory.remember("key1", {"value": 42})
+    assert await memory.recall("key1") == {"value": 42}
 
 
-@pytest.mark.asyncio
-async def test_forget(memory_with_mock):
-    mem, store, _ = memory_with_mock
-    await mem.remember("key2", "hello")
-    await mem.forget("key2")
-    result = await mem.recall("key2")
-    assert result is None
+async def test_recall_missing_key_returns_none(memory):
+    assert await memory.recall("never_set") is None
 
 
-@pytest.mark.asyncio
-async def test_task_context(memory_with_mock):
-    mem, store, _ = memory_with_mock
+async def test_forget(memory):
+    await memory.remember("key2", "hello")
+    await memory.forget("key2")
+    assert await memory.recall("key2") is None
+
+
+async def test_task_context(memory):
     ctx = {"incident_id": "abc", "severity": "high"}
-    await mem.set_task_context("task-1", ctx)
-    result = await mem.get_task_context("task-1")
-    assert result == ctx
+    await memory.set_task_context("task-1", ctx)
+    assert await memory.get_task_context("task-1") == ctx
 
 
-@pytest.mark.asyncio
-async def test_working_memory_structure(memory_with_mock):
-    mem, _, _ = memory_with_mock
-    wm = mem.new_working_memory()
+def test_working_memory_structure(memory):
+    wm = memory.new_working_memory()
     assert wm["agent"] == "test_agent"
     assert isinstance(wm["observations"], list)
     assert isinstance(wm["decisions"], list)
     assert isinstance(wm["tool_calls"], list)
+    assert wm["started_at"]
 
 
-@pytest.mark.asyncio
-async def test_log_event(memory_with_mock):
-    mem, _, lists = memory_with_mock
-    await mem.log_event({"type": "task_start", "task_id": "t1"})
-    await mem.log_event({"type": "task_end", "task_id": "t1"})
-    history = await mem.get_history(limit=10)
+async def test_log_event(memory):
+    await memory.log_event({"type": "task_start", "task_id": "t1"})
+    await memory.log_event({"type": "task_end", "task_id": "t1"})
+    history = await memory.get_history(limit=10)
     assert len(history) == 2
     assert history[0]["type"] == "task_end"
+    assert "ts" in history[0]
 
 
-@pytest.mark.asyncio
-async def test_blackboard_set_and_get(memory_with_mock):
-    mem, store, _ = memory_with_mock
-    await mem.blackboard_set("threat_level", "critical")
-    result = await mem.blackboard_get("threat_level")
-    assert result == "critical"
+async def test_log_event_does_not_mutate_caller_dict(memory):
+    event = {"type": "task_start"}
+    await memory.log_event(event)
+    assert "ts" not in event
 
 
-@pytest.mark.asyncio
-async def test_blackboard_update(memory_with_mock):
-    mem, _, _ = memory_with_mock
-    await mem.blackboard_set("state", {"a": 1})
-    await mem.blackboard_update("state", {"b": 2})
-    result = await mem.blackboard_get("state")
-    assert result == {"a": 1, "b": 2}
+async def test_history_is_capped(memory, fake_cache):
+    for i in range(HISTORY_LIMIT + 25):
+        await memory.log_event({"type": "tick", "i": i})
+    assert len(fake_cache.lists["agent:test_agent:history"]) == HISTORY_LIMIT
 
 
-@pytest.mark.asyncio
-async def test_namespace_isolation(memory_with_mock):
-    mem, store, _ = memory_with_mock
-    from core.memory.agent_memory import AgentMemory
-    with patch("core.memory.agent_memory.cache", mem._AgentMemory__class__ if hasattr(mem, '__class__') else MagicMock()):
-        pass
-    await mem.remember("shared_key", "agent_value")
-    # Key should be namespaced
-    namespaced_key = "agent:test_agent:st:shared_key"
-    assert namespaced_key in store
+async def test_log_event_survives_redis_failure(memory, fake_cache):
+    async def boom(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    fake_cache.lpush = boom
+    # Telemetry must never take down an analysis run.
+    await memory.log_event({"type": "task_start"})
+
+
+async def test_blackboard_set_and_get(memory):
+    await memory.blackboard_set("threat_level", "critical")
+    assert await memory.blackboard_get("threat_level") == "critical"
+
+
+async def test_blackboard_update(memory):
+    await memory.blackboard_set("state", {"a": 1})
+    await memory.blackboard_update("state", {"b": 2})
+    assert await memory.blackboard_get("state") == {"a": 1, "b": 2}
+
+
+async def test_blackboard_update_on_missing_key_creates_it(memory):
+    await memory.blackboard_update("fresh", {"a": 1})
+    assert await memory.blackboard_get("fresh") == {"a": 1}
+
+
+async def test_blackboard_update_replaces_non_dict_value(memory):
+    """A scalar left on the blackboard must not break a later dict update."""
+    await memory.blackboard_set("state", "critical")
+    await memory.blackboard_update("state", {"b": 2})
+    assert await memory.blackboard_get("state") == {"b": 2}
+
+
+async def test_namespace_isolation(memory, fake_cache):
+    other = AgentMemory("other_agent")
+    await memory.remember("shared_key", "agent_value")
+    await other.remember("shared_key", "other_value")
+
+    assert "agent:test_agent:st:shared_key" in fake_cache.store
+    assert "agent:other_agent:st:shared_key" in fake_cache.store
+    assert await memory.recall("shared_key") == "agent_value"
+    assert await other.recall("shared_key") == "other_value"
