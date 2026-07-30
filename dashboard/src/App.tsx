@@ -8,6 +8,7 @@ import { LoginScreen } from "./components/Login/LoginScreen";
 import { ThreatLevelBanner } from "./components/Dashboard/ThreatLevelBanner";
 import { MetricsRow } from "./components/Dashboard/MetricsRow";
 import { AlertChart } from "./components/Dashboard/AlertChart";
+import { ThreatSeverityPanel } from "./components/Dashboard/ThreatSeverityPanel";
 import { AgentStatusGrid } from "./components/AgentStatus/AgentStatusGrid";
 import { AlertFeed } from "./components/AlertFeed/AlertFeed";
 import { IncidentPanel } from "./components/IncidentPanel/IncidentPanel";
@@ -72,6 +73,7 @@ function SOCDashboard({ username, role }: { username: string; role: string }) {
         {/* Center: Charts + Agent Grid */}
         <div className="lg:col-span-1 space-y-4">
           <AlertChart />
+          <ThreatSeverityPanel />
           <AgentStatusGrid />
         </div>
 

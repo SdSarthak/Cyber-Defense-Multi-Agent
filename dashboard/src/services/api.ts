@@ -52,7 +52,8 @@ export const api = {
     request("/api/v1/threats/analyze", { method: "POST", body: JSON.stringify(event) }),
   getRecentThreats: (limit = 50) =>
     request<{ threats: any[] }>(`/api/v1/threats/recent?limit=${limit}`),
-  getThreatStats: () => request<Record<string, any>>("/api/v1/threats/stats"),
+  getThreatStats: (hours = 24) =>
+    request<Record<string, any>>(`/api/v1/threats/stats?hours=${hours}`),
 
   respondToIncident: (incident: object) =>
     request("/api/v1/incidents/respond", { method: "POST", body: JSON.stringify(incident) }),
