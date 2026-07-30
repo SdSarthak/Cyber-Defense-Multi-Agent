@@ -1,8 +1,14 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createWebSocket } from "../services/api";
 import { useStore } from "../store/useStore";
 
 const RECONNECT_DELAY_MS = 3000;
+
+export interface OverrideResult {
+  command: string;
+  ok: boolean;
+  error?: string;
+}
 
 /**
  * Live telemetry socket.
@@ -15,6 +21,7 @@ export function useWebSocket(enabled: boolean = true) {
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closedRef = useRef(false);
+  const [lastOverride, setLastOverride] = useState<OverrideResult | null>(null);
 
   // Selecting actions individually keeps this effect from re-running on every
   // alert that lands in the store.
@@ -31,9 +38,19 @@ export function useWebSocket(enabled: boolean = true) {
       if (closedRef.current) return;
 
       const ws = createWebSocket((msg) => {
-        // The server's opening frame is a handshake ack, and override replies are
-        // request/response — neither belongs in the alert feed.
-        if (msg?.type === "connected" || msg?.type === "override_result" || msg?.type === "error") {
+        // An override reply is the answer to a command the operator just issued, so
+        // it is surfaced on the control that issued it rather than in the alert feed.
+        if (msg?.type === "override_result") {
+          setLastOverride({
+            command: msg.command,
+            ok: Boolean(msg.result?.ok),
+            error: msg.result?.error,
+          });
+          return;
+        }
+
+        // The opening frame is a handshake ack; protocol errors are not alerts.
+        if (msg?.type === "connected" || msg?.type === "error") {
           return;
         }
 
@@ -87,9 +104,10 @@ export function useWebSocket(enabled: boolean = true) {
   const sendOverride = useCallback((command: string, payload: object) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    setLastOverride(null);
     ws.send(JSON.stringify({ type: "human_override", command, payload }));
     return true;
   }, []);
 
-  return { sendOverride };
+  return { sendOverride, lastOverride };
 }

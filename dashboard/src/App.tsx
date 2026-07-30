@@ -26,7 +26,7 @@ const queryClient = new QueryClient({
 });
 
 function SOCDashboard({ username, role }: { username: string; role: string }) {
-  useWebSocket();
+  const { sendOverride, lastOverride } = useWebSocket();
   useSocData();
 
   function signOut() {
@@ -74,7 +74,11 @@ function SOCDashboard({ username, role }: { username: string; role: string }) {
         <div className="lg:col-span-1 space-y-4">
           <AlertChart />
           <ThreatSeverityPanel />
-          <AgentStatusGrid />
+          <AgentStatusGrid
+            canOverride={role === "admin"}
+            onOverride={sendOverride}
+            overrideResult={lastOverride}
+          />
         </div>
 
         {/* Right: Incident + Compliance */}

@@ -150,6 +150,22 @@ async def escalation_listener(supervisor):
             log.warning("escalation_listener.failed", error=str(exc))
 
 
+def _reject_unknown_agent(command: str, agent, supervisor) -> dict | None:
+    """
+    Validate ``payload.agent`` for the commands that need one.
+
+    Without this a typo writes a pause key for an agent that does not exist: the
+    command reports success, the operator believes the agent is stopped, and it keeps
+    running. Returns an error payload, or None when the name is acceptable.
+    """
+    if not agent:
+        return {"ok": False, "error": f"{command} requires payload.agent"}
+    known = getattr(supervisor, "agent_names", None)
+    if known and agent not in known:
+        return {"ok": False, "error": f"Unknown agent: {agent}", "supported": list(known)}
+    return None
+
+
 async def _handle_override(command: str, payload: dict, supervisor=None) -> dict:
     """Apply a human override command. Returns a result payload for the caller."""
     from agents.base_agent import BaseSecurityAgent
@@ -157,14 +173,16 @@ async def _handle_override(command: str, payload: dict, supervisor=None) -> dict
     agent = payload.get("agent")
 
     if command == "pause_agent":
-        if not agent:
-            return {"ok": False, "error": "pause_agent requires payload.agent"}
+        rejection = _reject_unknown_agent(command, agent, supervisor)
+        if rejection:
+            return rejection
         await BaseSecurityAgent.pause(agent)
         return {"ok": True, "agent": agent, "status": "paused"}
 
     if command == "resume_agent":
-        if not agent:
-            return {"ok": False, "error": "resume_agent requires payload.agent"}
+        rejection = _reject_unknown_agent(command, agent, supervisor)
+        if rejection:
+            return rejection
         await BaseSecurityAgent.resume(agent)
         return {"ok": True, "agent": agent, "status": "resumed"}
 
@@ -178,11 +196,9 @@ async def _handle_override(command: str, payload: dict, supervisor=None) -> dict
     if command == "run_agent":
         if supervisor is None:
             return {"ok": False, "error": "Supervisor unavailable"}
-        if not agent:
-            return {"ok": False, "error": "run_agent requires payload.agent"}
-        if agent not in supervisor.agent_names:
-            return {"ok": False, "error": f"Unknown agent: {agent}",
-                    "supported": supervisor.agent_names}
+        rejection = _reject_unknown_agent(command, agent, supervisor)
+        if rejection:
+            return rejection
         result = await supervisor._run_agent(agent, payload.get("task") or {})
         return {"ok": True, "agent": agent, "summary": result.get("summary", "")}
 

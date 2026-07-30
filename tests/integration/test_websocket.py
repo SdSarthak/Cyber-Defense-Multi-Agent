@@ -133,12 +133,24 @@ def test_pause_agent_requires_agent_name(client):
     assert reply["result"]["ok"] is False
 
 
-def test_run_agent_rejects_unknown_agent(client):
+@pytest.mark.parametrize("command", ["run_agent", "pause_agent", "resume_agent"])
+def test_agent_commands_reject_unknown_agent(client, command):
+    """
+    A typo must not silently succeed. `pause_agent` used to write a pause key for any
+    string, so the operator was told an agent had stopped while it kept running.
+    """
     with client.websocket_connect(f"/ws?token={_admin_token()}") as ws:
         ws.receive_json()
-        reply = _override(ws, "run_agent", {"agent": "nope"})
+        reply = _override(ws, command, {"agent": "nope"})
     assert reply["result"]["ok"] is False
     assert "Unknown agent" in reply["result"]["error"]
+
+
+def test_pause_agent_does_not_write_a_key_for_unknown_agent(client, fake_cache):
+    with client.websocket_connect(f"/ws?token={_admin_token()}") as ws:
+        ws.receive_json()
+        _override(ws, "pause_agent", {"agent": "nope"})
+    assert not [k for k in fake_cache.store if "nope" in k]
 
 
 def test_override_is_audited_on_the_event_bus(client, fake_cache):
