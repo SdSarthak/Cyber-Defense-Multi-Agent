@@ -4,6 +4,7 @@ import json
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from jose import JWTError, jwt
 
 from core import metrics
 from core.config import settings
@@ -17,6 +18,47 @@ CHANNELS = ["agent_events", "escalations", "incident_updates"]
 
 # Commands a dashboard operator may issue over the socket.
 OVERRIDE_COMMANDS = ("pause_agent", "resume_agent", "set_threat_level", "run_agent")
+
+# Overrides that mutate agent state are admin-only; everyone else gets read-only telemetry.
+ADMIN_ONLY_COMMANDS = ("pause_agent", "resume_agent", "run_agent")
+
+# RFC 6455 close codes. 1008 = policy violation, which is what browsers surface for
+# an auth failure during the handshake.
+WS_POLICY_VIOLATION = 1008
+
+
+def _extract_ws_token(ws: WebSocket) -> str:
+    """
+    Pull a bearer token off the handshake.
+
+    Browsers cannot set headers on a WebSocket handshake, so `?token=` is the
+    portable option; the Authorization header is still honoured for CLI clients.
+    """
+    token = ws.query_params.get("token", "")
+    if token:
+        return token.strip()
+    header = ws.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return ""
+
+
+def authenticate_websocket(ws: WebSocket) -> dict | None:
+    """
+    Return the JWT claims for a socket, or None when the handshake is not authorised.
+
+    When `websocket_auth_required` is off the socket is treated as an anonymous
+    analyst — useful for local demos, never for a deployment reachable off-host.
+    """
+    token = _extract_ws_token(ws)
+    if not token:
+        if settings.websocket_auth_required:
+            return None
+        return {"sub": "anonymous", "role": "analyst"}
+    try:
+        return jwt.decode(token, settings.api_secret_key, algorithms=[settings.api_algorithm])
+    except JWTError:
+        return None
 
 
 class ConnectionManager:
@@ -149,7 +191,20 @@ async def _handle_override(command: str, payload: dict, supervisor=None) -> dict
 
 @ws_router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    claims = authenticate_websocket(ws)
+    if claims is None:
+        # Close before accepting: the client never sees a half-open authorised socket.
+        await ws.close(code=WS_POLICY_VIOLATION, reason="Missing or invalid token")
+        return
+
+    role = claims.get("role", "analyst")
     await manager.connect(ws)
+    await ws.send_json({
+        "type": "connected",
+        "user": claims.get("sub"),
+        "role": role,
+        "channels": CHANNELS,
+    })
     try:
         while True:
             # Accept any incoming messages (human override commands)
@@ -174,6 +229,14 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 continue
 
+            if command in ADMIN_ONLY_COMMANDS and role != "admin":
+                await ws.send_json({
+                    "type": "override_result",
+                    "command": command,
+                    "result": {"ok": False, "error": f"Role '{role}' may not run {command}"},
+                })
+                continue
+
             try:
                 supervisor = getattr(ws.app.state, "supervisor", None)
                 result = await _handle_override(command, payload, supervisor)
@@ -187,6 +250,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await redis_client.cache.publish("agent_events", {
                     "agent": "human",
                     "event": "override",
+                    "user": claims.get("sub"),
                     "command": command,
                     "payload": payload,
                     "result": result,

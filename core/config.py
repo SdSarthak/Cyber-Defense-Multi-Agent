@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     api_access_token_expire_minutes: int = 60
     cors_origins: str = "http://localhost:3000"
 
+    # The /ws socket accepts privileged override commands, so it authenticates the
+    # same JWT the REST API does. Disable only for a local, single-user demo.
+    websocket_auth_required: bool = True
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
