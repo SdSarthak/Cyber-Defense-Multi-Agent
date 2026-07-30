@@ -7,36 +7,89 @@ import json
 import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable
+
+from core.config import settings
 from simulation.log_generators.generators import generate_batch
+from tests.conftest import FakeRedisCache, make_llm
+
+# Every coroutine on the fake cache that the application code reaches for.
+CACHE_METHODS = (
+    "set", "get", "delete", "exists", "expire", "publish", "lpush", "rpop",
+    "lrange", "ltrim", "llen", "incr", "set_if_absent", "hset", "hgetall",
+)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def make_fast_cache():
-    store = {}
-    lists = {}
-    m = MagicMock()
-    m.set = AsyncMock(side_effect=lambda k, v, ttl=None: store.update({k: v}))
-    m.get = AsyncMock(side_effect=lambda k: store.get(k))
-    m.delete = AsyncMock(side_effect=lambda k: store.pop(k, None))
-    m.exists = AsyncMock(side_effect=lambda k: k in store)
-    m.publish = AsyncMock()
-    m.lpush = AsyncMock(side_effect=lambda k, v: lists.setdefault(k, []).insert(0, v))
-    m.lrange = AsyncMock(side_effect=lambda k, s, e: lists.get(k, [])[s: None if e == -1 else e + 1])
-    m.hset = AsyncMock()
-    m.hgetall = AsyncMock(return_value={})
-    m.incr = AsyncMock(return_value=1)
-    m._redis = MagicMock()
-    m._redis.ltrim = AsyncMock()
-    return m, store
+    """
+    The shared in-memory cache with every method wrapped in an ``AsyncMock``, so the
+    assertions below can read ``call_count`` / ``call_args_list``.
+
+    Wrapping rather than replacing matters. These tests drive real agent graphs, and
+    those graphs read back what they wrote — blackboard values, dedupe keys, incident
+    records. A bare ``MagicMock`` answers every read with another mock, so the agents
+    quietly take their fallback paths instead of the ones under load.
+    """
+    fake = FakeRedisCache()
+    for name in CACHE_METHODS:
+        setattr(fake, name, AsyncMock(side_effect=getattr(fake, name)))
+    return fake, fake.store
 
 
 def make_fast_llm(response: dict):
-    r = MagicMock()
-    r.content = json.dumps(response)
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(return_value=r)
-    return llm
+    """
+    Deterministic chat-model stub.
+
+    It has to be a real ``Runnable``: agents build chains as ``PROMPT | self.llm`` and
+    LangChain coerces a plain mock into a ``RunnableLambda`` whose result carries a
+    mock ``.content``. Every agent would then fall into its JSON parse-failure branch,
+    and the test would be asserting against the fallback instead of the canned verdict.
+    """
+    return make_llm(response)
+
+
+class RotatingStubModel(Runnable):
+    """Chat-model stub that cycles through a list of canned JSON responses."""
+
+    def __init__(self, responses: list[dict]):
+        self._responses = [json.dumps(r) for r in responses]
+        self.calls = 0
+
+    def _next(self) -> AIMessage:
+        content = self._responses[self.calls % len(self._responses)]
+        self.calls += 1
+        return AIMessage(content=content)
+
+    def invoke(self, input, config=None, **kwargs):
+        return self._next()
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        return self._next()
+
+
+class SlowStubModel(Runnable):
+    """Chat model that never answers in time — used to trip the agent watchdog."""
+
+    def __init__(self, delay: float):
+        self._delay = delay
+
+    def invoke(self, input, config=None, **kwargs):
+        time.sleep(self._delay)
+        return AIMessage(content="{}")
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        await asyncio.sleep(self._delay)
+        return AIMessage(content="{}")
+
+
+def make_stub_tool(payload: str):
+    """Stand-in for a LangChain ``@tool``; agents only ever call ``.ainvoke`` on one."""
+    stub = MagicMock()
+    stub.ainvoke = AsyncMock(return_value=payload)
+    return stub
 
 
 # ─── Log Generator Stress ─────────────────────────────────────────────────────
@@ -66,7 +119,7 @@ class TestAgentMemoryStress:
     @pytest.mark.asyncio
     async def test_concurrent_remember_recall(self, monkeypatch):
         cache, store = make_fast_cache()
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
+        monkeypatch.setattr("core.database.redis_client.cache", cache)
         from core.memory.agent_memory import AgentMemory
 
         async def worker(i: int):
@@ -80,7 +133,7 @@ class TestAgentMemoryStress:
     @pytest.mark.asyncio
     async def test_blackboard_concurrent_updates(self, monkeypatch):
         cache, store = make_fast_cache()
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
+        monkeypatch.setattr("core.database.redis_client.cache", cache)
         from core.memory.agent_memory import AgentMemory
 
         async def updater(i: int):
@@ -92,7 +145,7 @@ class TestAgentMemoryStress:
     @pytest.mark.asyncio
     async def test_history_log_high_volume(self, monkeypatch):
         cache, store = make_fast_cache()
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
+        monkeypatch.setattr("core.database.redis_client.cache", cache)
         from core.memory.agent_memory import AgentMemory
         mem = AgentMemory("stress_agent")
 
@@ -108,8 +161,6 @@ class TestThreatAgentStress:
     def agent(self, monkeypatch):
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value="context"))
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             MockLLM.return_value = make_fast_llm({
                 "threat_type": "port_scan", "severity": "medium", "confidence": 0.8,
@@ -117,7 +168,9 @@ class TestThreatAgentStress:
                 "reasoning": "ok", "should_escalate": False,
             })
             from agents.threat_detection.agent import ThreatDetectionAgent
-            return ThreatDetectionAgent()
+            # Yield inside the patch: `BaseSecurityAgent.llm` is lazy, so the real
+            # Gemini client would be built on first use if the patch had already exited.
+            yield ThreatDetectionAgent()
 
     @pytest.mark.asyncio
     async def test_sequential_100_events(self, agent):
@@ -154,7 +207,6 @@ class TestLogAnalysisStress:
     def agent(self, monkeypatch):
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             MockLLM.return_value = make_fast_llm({
                 "anomaly_count": 1, "total_analyzed": 50,
@@ -164,7 +216,9 @@ class TestLogAnalysisStress:
                 "patterns_detected": [], "risk_summary": "ok",
             })
             from agents.log_analysis.agent import LogAnalysisAgent
-            return LogAnalysisAgent()
+            # Yield inside the patch: `BaseSecurityAgent.llm` is lazy, so the real
+            # Gemini client would be built on first use if the patch had already exited.
+            yield LogAnalysisAgent()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("batch_size", [10, 50, 100, 200])
@@ -204,14 +258,10 @@ class TestSupervisorStress:
     def supervisor(self, monkeypatch):
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value=""))
-        monkeypatch.setattr("core.rag.rag_chain.vuln_rag", AsyncMock(return_value=""))
-        monkeypatch.setattr("core.rag.rag_chain.compliance_rag", AsyncMock(return_value=""))
-        monkeypatch.setattr("core.tools.threat_tools.get_nvd_cve", AsyncMock(return_value='{"error": "mocked"}'))
-        monkeypatch.setattr("core.tools.threat_tools.scan_asset_ports", AsyncMock(return_value='{"open_ports":[],"exposed_services":[],"risk_level":"low"}'))
-        monkeypatch.setattr("core.tools.threat_tools.enrich_ip", AsyncMock(return_value='{"risk_score":0}'))
-        monkeypatch.setattr("core.tools.threat_tools.score_ioc", AsyncMock(return_value='{"risk_score":0}'))
+        monkeypatch.setattr("core.tools.threat_tools.get_nvd_cve", make_stub_tool('{"error": "mocked"}'))
+        monkeypatch.setattr("core.tools.threat_tools.scan_asset_ports", make_stub_tool('{"open_ports":[],"exposed_services":[],"risk_level":"low"}'))
+        monkeypatch.setattr("core.tools.threat_tools.enrich_ip", make_stub_tool('{"risk_score":0}'))
+        monkeypatch.setattr("core.tools.threat_tools.score_ioc", make_stub_tool('{"risk_score":0}'))
 
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             llm = make_fast_llm({
@@ -223,7 +273,9 @@ class TestSupervisorStress:
             })
             MockLLM.return_value = llm
             from agents.supervisor.agent import SupervisorAgent
-            return SupervisorAgent()
+            # Yield inside the patch: `BaseSecurityAgent.llm` is lazy, so the real
+            # Gemini client would be built on first use if the patch had already exited.
+            yield SupervisorAgent()
 
     @pytest.mark.asyncio
     async def test_supervisor_routes_and_dispatches(self, supervisor):
@@ -253,8 +305,6 @@ class TestEndToEndPipelineStress:
         """Simulate 20 attack events flowing through detection → response."""
         cache, store = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value=""))
 
         threat_resp = {
             "threat_type": "brute_force", "severity": "high", "confidence": 0.95,
@@ -269,18 +319,8 @@ class TestEndToEndPipelineStress:
         }
 
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
-            call_count = 0
-
-            async def rotating_response(*args, **kwargs):
-                nonlocal call_count
-                call_count += 1
-                r = MagicMock()
-                r.content = json.dumps(threat_resp if call_count % 2 == 1 else ir_resp)
-                return r
-
-            llm = MagicMock()
-            llm.ainvoke = rotating_response
-            MockLLM.return_value = llm
+            # Odd calls come from the detection agent, even ones from the responder.
+            MockLLM.return_value = RotatingStubModel([threat_resp, ir_resp])
 
             from agents.threat_detection.agent import ThreatDetectionAgent
             from agents.incident_response.agent import IncidentResponseAgent
@@ -355,36 +395,33 @@ class TestEndToEndPipelineStress:
 class TestFailureInjection:
     @pytest.mark.asyncio
     async def test_threat_agent_survives_llm_timeout(self, monkeypatch):
+        """A hung model must trip the watchdog and leave the agent marked errored."""
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value=""))
+        monkeypatch.setattr(settings, "agent_timeout_seconds", 0.2)
 
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
-            async def slow_invoke(*a, **kw):
-                await asyncio.sleep(0.01)
-                r = MagicMock()
-                r.content = json.dumps({
-                    "threat_type": "unknown", "severity": "low", "confidence": 0.3,
-                    "indicators": [], "mitre_tactics": [], "mitre_techniques": [],
-                    "reasoning": "slow", "should_escalate": False,
-                })
-                return r
-            llm = MagicMock()
-            llm.ainvoke = slow_invoke
-            MockLLM.return_value = llm
+            MockLLM.return_value = SlowStubModel(delay=5.0)
             from agents.threat_detection.agent import ThreatDetectionAgent
             agent = ThreatDetectionAgent()
-            result = await agent.run({"message": "test"})
-        assert "severity" in result
+
+            with pytest.raises(asyncio.TimeoutError):
+                await agent._run_with_telemetry({"message": "test"})
+
+        statuses = [c.args[1]["status"] for c in cache.hset.call_args_list]
+        assert statuses[-1] == "error"
 
     @pytest.mark.asyncio
     async def test_threat_agent_survives_rag_failure(self, monkeypatch):
+        """Retrieval is an enhancement: a broken ChromaDB must not fail the run."""
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag",
-                            AsyncMock(side_effect=Exception("Chroma unavailable")))
+        # Turn retrieval back on (conftest disables it) so the failure path is reached.
+        monkeypatch.setattr(settings, "rag_enabled", True)
+        monkeypatch.setattr(
+            "core.rag.rag_chain.build_rag_chain",
+            MagicMock(side_effect=Exception("Chroma unavailable")),
+        )
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             MockLLM.return_value = make_fast_llm({
                 "threat_type": "unknown", "severity": "low", "confidence": 0.3,
@@ -394,13 +431,12 @@ class TestFailureInjection:
             from agents.threat_detection.agent import ThreatDetectionAgent
             agent = ThreatDetectionAgent()
             result = await agent.run({"message": "test"})
-        assert "threat_assessment" in result
+        assert result["threat_assessment"]["threat_type"] == "unknown"
 
     @pytest.mark.asyncio
     async def test_log_agent_handles_corrupt_log_entries(self, monkeypatch):
         cache, _ = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             MockLLM.return_value = make_fast_llm({
                 "anomaly_count": 0, "total_analyzed": 5, "anomalies": [],
@@ -425,8 +461,6 @@ class TestFailureInjection:
         cache, _ = make_fast_cache()
         cache.publish = AsyncMock(side_effect=Exception("Redis connection lost"))
         monkeypatch.setattr("core.database.redis_client.cache", cache)
-        monkeypatch.setattr("core.memory.agent_memory.cache", cache)
-        monkeypatch.setattr("core.rag.rag_chain.threat_rag", AsyncMock(return_value=""))
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:
             MockLLM.return_value = make_fast_llm({
                 "threat_type": "port_scan", "severity": "low", "confidence": 0.5,

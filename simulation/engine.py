@@ -3,10 +3,16 @@ import asyncio
 import random
 import structlog
 from core.config import settings
-from core.database.redis_client import cache
+# Reached through the module object rather than imported by value, so the one
+# patch point used everywhere else in the codebase also swaps the store here.
+from core.database import redis_client
 from simulation.log_generators.generators import generate_batch, ATTACK_GENERATORS, make_web_log
 
 log = structlog.get_logger()
+
+# Spacing between APT stages, so the multi-stage campaign arrives as a sequence of
+# distinct events rather than one indistinguishable burst.
+APT_STAGE_DELAY_SECONDS = 2.0
 
 
 class SimulationEngine:
@@ -34,9 +40,9 @@ class SimulationEngine:
             )
             # Push each log to ES-simulation queue and Redis
             for entry in batch:
-                await cache.lpush("sim:log_queue", entry)
+                await redis_client.cache.lpush("sim:log_queue", entry)
             # Notify log analysis agent
-            await cache.publish("agent_events", {
+            await redis_client.cache.publish("agent_events", {
                 "agent": "simulation",
                 "event": "logs_ready",
                 "count": len(batch),
@@ -66,8 +72,8 @@ class SimulationEngine:
             for p in range(10000, 10050)
         ]
         for entry in batch:
-            await cache.lpush("sim:log_queue", entry)
-        await cache.publish("escalations", {
+            await redis_client.cache.lpush("sim:log_queue", entry)
+        await redis_client.cache.publish("escalations", {
             "agent": "simulation",
             "severity": "high",
             "threat_type": "brute_force",
@@ -89,8 +95,8 @@ class SimulationEngine:
             for p in payloads
         ]
         for entry in batch:
-            await cache.lpush("sim:log_queue", entry)
-        await cache.publish("escalations", {
+            await redis_client.cache.lpush("sim:log_queue", entry)
+        await redis_client.cache.publish("escalations", {
             "agent": "simulation",
             "severity": "critical",
             "threat_type": "sql_injection",
@@ -119,9 +125,9 @@ class SimulationEngine:
                                "size_mb": 500, "attack_type": "data_exfiltration", "stage": "exfil"}},
         ]
         for stage in stages:
-            await cache.lpush("sim:log_queue", stage)
-            await asyncio.sleep(2)
-        await cache.publish("escalations", {
+            await redis_client.cache.lpush("sim:log_queue", stage)
+            await asyncio.sleep(APT_STAGE_DELAY_SECONDS)
+        await redis_client.cache.publish("escalations", {
             "agent": "simulation",
             "severity": "critical",
             "threat_type": "apt_campaign",
@@ -132,7 +138,7 @@ class SimulationEngine:
 
     async def _heartbeat(self):
         while self._running:
-            await cache.set("sim:heartbeat", {"tick": self._tick, "running": self._running}, ttl=60)
+            await redis_client.cache.set("sim:heartbeat", {"tick": self._tick, "running": self._running}, ttl=60)
             await asyncio.sleep(10)
 
     def stop(self):
