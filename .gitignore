@@ -1,8 +1,12 @@
 # ─── Secrets ──────────────────────────────────────────────────────────────────
 .env
+.env.local
+.env.*.local
 *.key
 *.pem
 *.p12
+credentials.json
+serviceAccount*.json
 secrets/
 
 # ─── Python ───────────────────────────────────────────────────────────────────
@@ -33,6 +37,7 @@ htmlcov/
 .tox/
 
 # ─── Node / React dashboard ───────────────────────────────────────────────────
+node_modules/
 dashboard/node_modules/
 dashboard/build/
 dashboard/.env.local
@@ -60,11 +65,22 @@ grafana_data/
 logs/
 *.log
 
-# ─── ML model cache ───────────────────────────────────────────────────────────
+# ─── ML models / large artefacts ──────────────────────────────────────────────
 .cache/
 models/
 sentence_transformers/
 huggingface/
+*.h5
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.onnx
+*.safetensors
+data/raw/
+datasets/
+*.csv.gz
+*.parquet
 
 # ─── IDE / OS ─────────────────────────────────────────────────────────────────
 .idea/
