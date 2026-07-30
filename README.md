@@ -153,14 +153,18 @@ A React 18 + Tailwind SPA served on port 3000.
 |---|---|
 | Threat level banner | Current blackboard threat level, pushed live over the socket |
 | Metrics row | Incident, threat and agent counters |
-| Alert chart | Alert volume over time |
-| Agent status grid | Per-agent idle / running / error / paused state |
+| Alert chart | Alert volume over time, bucketed by minute |
+| Threat severity | Persisted detections by severity over 24h / 7d / 30d |
+| Agent status grid | Per-agent idle / running / error / paused state, with pause & resume controls for admins |
 | Alert feed | Streaming `agent_events` and `escalations` |
 | Incident panel | Open incidents with playbook and containment status |
 | Compliance view | Latest framework scores |
 
 Snapshot data is polled from the REST API every 15s so counters survive a reload;
-everything that happens while the page is open arrives over the WebSocket.
+everything that happens while the page is open arrives over the WebSocket. Signing in
+as `admin` also enables the pause/resume buttons on the agent grid — those travel as
+`human_override` frames on the same socket, and the server refuses them for an
+`analyst` token.
 
 ```bash
 cd dashboard
