@@ -116,7 +116,14 @@ Services started:
 | Prometheus | http://localhost:9090 |
 | Elasticsearch | http://localhost:9200 |
 
-### 4. Run in dev mode (no Docker)
+### 6. Sign in
+
+The dashboard opens on a login screen. Use the credentials from your `.env`
+(`ADMIN_USERNAME` / `ADMIN_PASSWORD`, default `admin` / `admin123`). The JWT it
+returns authorises both the REST calls and the live WebSocket feed; an expired token
+drops you back to the login screen automatically.
+
+### 7. Run in dev mode (no Docker)
 
 ```bash
 # Backend
@@ -130,6 +137,35 @@ npm start
 
 # Simulation engine (generates fake attack traffic)
 python -m simulation.engine
+```
+
+The dashboard reads `REACT_APP_API_URL` and `REACT_APP_WS_URL` — copy
+`dashboard/.env.example` to `dashboard/.env.local` if the API is not on
+`localhost:8000`.
+
+---
+
+## Dashboard
+
+A React 18 + Tailwind SPA served on port 3000.
+
+| View | What it shows |
+|---|---|
+| Threat level banner | Current blackboard threat level, pushed live over the socket |
+| Metrics row | Incident, threat and agent counters |
+| Alert chart | Alert volume over time |
+| Agent status grid | Per-agent idle / running / error / paused state |
+| Alert feed | Streaming `agent_events` and `escalations` |
+| Incident panel | Open incidents with playbook and containment status |
+| Compliance view | Latest framework scores |
+
+Snapshot data is polled from the REST API every 15s so counters survive a reload;
+everything that happens while the page is open arrives over the WebSocket.
+
+```bash
+cd dashboard
+npm run typecheck   # tsc --noEmit
+npm run build       # production bundle into dashboard/build
 ```
 
 ---
@@ -193,15 +229,24 @@ curl http://localhost:8000/api/v1/agents/status \
   -H "Authorization: Bearer <token>"
 ```
 
-Default credentials: `admin / admin123` or `analyst / analyst123`.
+Credentials come from `ADMIN_USERNAME` / `ADMIN_PASSWORD` and `ANALYST_USERNAME` /
+`ANALYST_PASSWORD` in `.env` (defaults: `admin / admin123`, `analyst / analyst123`).
+The token carries a role: `admin` may issue agent overrides, `analyst` is read-only.
+
+`/health`, `/metrics`, `/docs` and `/api/v1/auth/*` are the only unauthenticated paths.
 
 ### Agents
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/v1/agents/status` | Status of all 7 agents |
-| GET | `/api/v1/agents/{name}/history` | Agent event history |
-| POST | `/api/v1/agents/run` | Run any agent with a payload |
+| GET | `/api/v1/agents/registry` | Agent names and descriptions |
 | GET | `/api/v1/agents/blackboard` | Shared agent blackboard state |
+| POST | `/api/v1/agents/run` | Run any agent with a payload |
+| POST | `/api/v1/agents/supervisor/run` | Route a task through the Supervisor |
+| POST | `/api/v1/agents/{name}/pause` | Pause an agent (admin) |
+| POST | `/api/v1/agents/{name}/resume` | Resume an agent (admin) |
+| GET | `/api/v1/agents/{name}/status` | Status of one agent |
+| GET | `/api/v1/agents/{name}/history` | Agent event history |
 
 ### Threats
 | Method | Endpoint | Description |
@@ -209,11 +254,13 @@ Default credentials: `admin / admin123` or `analyst / analyst123`.
 | POST | `/api/v1/threats/analyze` | Analyze a single security event |
 | POST | `/api/v1/threats/batch-analyze` | Analyze up to 20 events |
 | GET | `/api/v1/threats/recent` | Recent threat detections |
+| GET | `/api/v1/threats/stats` | Severity breakdown over a trailing window |
 
 ### Incidents
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/v1/incidents/respond` | Trigger response playbook |
+| GET | `/api/v1/incidents/` | List recent incidents |
 | GET | `/api/v1/incidents/{id}` | Get incident details |
 | POST | `/api/v1/incidents/{id}/update` | Update incident status |
 
@@ -221,6 +268,7 @@ Default credentials: `admin / admin123` or `analyst / analyst123`.
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/v1/vulnerabilities/scan` | Scan CVEs + asset ports |
+| GET | `/api/v1/vulnerabilities/` | List stored risk reports |
 | GET | `/api/v1/vulnerabilities/cve/{id}` | Lookup a CVE from NVD |
 
 ### Compliance
@@ -228,17 +276,33 @@ Default credentials: `admin / admin123` or `analyst / analyst123`.
 |---|---|---|
 | POST | `/api/v1/compliance/evaluate` | Evaluate a framework (SOC2 / NIST CSF / ISO 27001) |
 | GET | `/api/v1/compliance/frameworks` | List supported frameworks |
+| GET | `/api/v1/compliance/frameworks/{framework}` | Controls for one framework |
+| GET | `/api/v1/compliance/history` | Past evaluations |
 
 ### Reports
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/v1/reports/generate` | Generate executive or threat report |
 | GET | `/api/v1/reports/` | List stored reports |
+| GET | `/api/v1/reports/{key}` | Fetch one stored report |
+
+### Operations
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Liveness |
+| GET | `/health/ready` | Readiness — per-dependency status |
+| GET | `/metrics` | Prometheus exposition |
 
 ### WebSocket
-Connect to `ws://localhost:8000/ws` to receive live events from all agents. Channels: `agent_events`, `escalations`, `incident_updates`.
+Connect to `ws://localhost:8000/ws?token=<jwt>` to receive live events from all
+agents. The token rides as a query parameter because browsers cannot set headers on
+a WebSocket handshake; a CLI client may send `Authorization: Bearer <jwt>` instead.
+An unauthenticated handshake is closed with code 1008.
 
-Send a human override:
+Channels: `agent_events`, `escalations`, `incident_updates`.
+
+Send a human override (`pause_agent`, `resume_agent`, `run_agent` require the
+`admin` role; `set_threat_level` is open to any authenticated operator):
 ```json
 { "type": "human_override", "command": "pause_agent", "payload": { "agent": "threat_detection" } }
 ```
@@ -247,17 +311,18 @@ Send a human override:
 
 ## Running Tests
 
+The whole suite runs with **no external services**: `tests/conftest.py` swaps Redis for
+an in-memory fake, stubs Gemini with deterministic canned responses, and switches off
+PostgreSQL persistence, Elasticsearch and ChromaDB.
+
 ```bash
-# Unit tests only
-pytest tests/unit/ -v
+pip install -r requirements.txt
 
-# Integration tests (requires running API)
-pytest tests/integration/ -v
+pytest                      # everything (unit + integration + stress)
+pytest tests/unit/ -v       # agents, parsing, config
+pytest tests/integration/   # API routes and WebSocket, over an ASGI transport
+pytest tests/stress/ -v     # concurrency, throughput, failure injection
 
-# Full stress suite
-pytest tests/stress/ -v --timeout=120
-
-# All tests with coverage
 pytest --cov=. --cov-report=term-missing
 ```
 
@@ -271,7 +336,12 @@ Only two are required to get started:
 |---|---|---|
 | `GOOGLE_API_KEY` | **Yes** | Google AI Studio API key |
 | `GEMINI_MODEL` | No | Model name (default: `gemini-2.5-flash`) |
+| `API_SECRET_KEY` | No | JWT signing key — **change this before deploying** |
+| `ADMIN_PASSWORD` | No | Dashboard admin password (default: `admin123`) |
 | `POSTGRES_PASSWORD` | No | DB password (default: `strongpassword123`) |
+| `ENABLE_PERSISTENCE` | No | Write to PostgreSQL; `false` runs Redis-only (default: `true`) |
+| `RAG_ENABLED` | No | Use ChromaDB retrieval (default: `true`) |
+| `WEBSOCKET_AUTH_REQUIRED` | No | Require a JWT on `/ws` (default: `true`) |
 | `SIMULATION_MODE` | No | Enable fake log generation (default: `true`) |
 | `SIMULATION_ATTACK_PROBABILITY` | No | 0.0–1.0 attack ratio (default: `0.05`) |
 
