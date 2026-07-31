@@ -36,7 +36,7 @@ async def scan_vulnerabilities(request: Request, body: VulnScanRequest):
 
 
 @router.get("/")
-async def list_vulnerabilities(limit: int = Query(default=50, le=200)):
+async def list_vulnerabilities(limit: int = Query(default=50, ge=1, le=200)):
     """Vulnerabilities recorded by previous scans, highest CVSS first."""
     vulns = await repository.list_vulnerabilities(limit=limit)
     return {"vulnerabilities": vulns, "count": len(vulns)}

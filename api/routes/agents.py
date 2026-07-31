@@ -1,9 +1,10 @@
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agents.base_agent import BaseSecurityAgent
+from api.middleware.auth import require_admin
 from core.database import redis_client, repository
 
 router = APIRouter()
@@ -70,7 +71,7 @@ async def get_blackboard():
     return board
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[Depends(require_admin)])
 async def run_agent(request: Request, body: TaskRequest):
     if body.agent not in AGENT_MAP:
         raise HTTPException(status_code=400, detail=f"Unknown agent: {body.agent}")
@@ -80,13 +81,13 @@ async def run_agent(request: Request, body: TaskRequest):
     return await supervisor._run_agent(body.agent, body.payload)
 
 
-@router.post("/supervisor/run")
+@router.post("/supervisor/run", dependencies=[Depends(require_admin)])
 async def run_supervisor(request: Request, payload: dict):
     supervisor = _get_supervisor(request)
     return await supervisor._run_with_telemetry(payload)
 
 
-@router.post("/{agent_name}/pause")
+@router.post("/{agent_name}/pause", dependencies=[Depends(require_admin)])
 async def pause_agent(agent_name: str):
     if agent_name not in AGENT_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
@@ -94,7 +95,7 @@ async def pause_agent(agent_name: str):
     return {"agent": agent_name, "status": "paused"}
 
 
-@router.post("/{agent_name}/resume")
+@router.post("/{agent_name}/resume", dependencies=[Depends(require_admin)])
 async def resume_agent(agent_name: str):
     if agent_name not in AGENT_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
@@ -110,7 +111,7 @@ async def get_agent_status(agent_name: str):
 
 
 @router.get("/{agent_name}/history")
-async def get_agent_history(agent_name: str, limit: int = 20):
+async def get_agent_history(agent_name: str, limit: int = Query(default=20, ge=1, le=200)):
     if agent_name not in AGENT_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_name}")
     try:

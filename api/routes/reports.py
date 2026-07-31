@@ -39,7 +39,7 @@ async def generate_report(request: Request, body: ReportRequest):
 
 
 @router.get("/")
-async def list_reports(limit: int = Query(default=20, le=100)):
+async def list_reports(limit: int = Query(default=20, ge=1, le=100)):
     try:
         index = await redis_client.cache.lrange("reports:index", 0, limit - 1)
     except Exception:

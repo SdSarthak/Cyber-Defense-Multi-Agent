@@ -55,7 +55,7 @@ async def get_framework_controls(framework: str):
 @router.get("/history")
 async def get_compliance_history(
     framework: str | None = Query(default=None),
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
 ):
     """Historical control evaluations recorded in PostgreSQL."""
     if framework and framework not in FRAMEWORKS:

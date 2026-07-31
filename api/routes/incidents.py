@@ -43,7 +43,7 @@ async def respond_to_incident(request: Request, body: IncidentRequest):
 
 @router.get("/")
 async def list_incidents(
-    limit: int = Query(default=20, le=100),
+    limit: int = Query(default=20, ge=1, le=100),
     status: str | None = Query(default=None),
 ):
     incidents = await repository.list_incidents(limit=limit, status=status)

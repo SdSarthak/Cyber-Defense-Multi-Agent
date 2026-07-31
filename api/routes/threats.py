@@ -55,7 +55,7 @@ async def batch_analyze(request: Request, events: list[ThreatEventRequest]):
 
 @router.get("/recent")
 async def get_recent_threats(
-    limit: int = Query(default=50, le=200),
+    limit: int = Query(default=50, ge=1, le=200),
     severity: str | None = Query(default=None),
 ):
     """

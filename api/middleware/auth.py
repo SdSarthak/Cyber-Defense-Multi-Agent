@@ -55,9 +55,20 @@ class AuthMiddleware:
         "/health", "/metrics", "/ws", "/docs", "/openapi.json", "/redoc", "/api/v1/auth",
     )
 
+    @classmethod
+    def _is_public(cls, path: str) -> bool:
+        """
+        Match a public prefix only on a path-segment boundary.
+
+        A bare ``startswith`` would exempt any future route whose path merely begins
+        with one of these strings — ``/api/v1/authorisation`` would ship unauthenticated
+        because it happens to start with ``/api/v1/auth``.
+        """
+        return any(path == p or path.startswith(p + "/") for p in cls._SKIP_PREFIXES)
+
     async def __call__(self, request: Request, call_next):
         path = request.url.path
-        if any(path.startswith(p) for p in self._SKIP_PREFIXES):
+        if self._is_public(path):
             return await call_next(request)
 
         if path.startswith("/api/v1/"):
@@ -76,6 +87,30 @@ class AuthMiddleware:
             request.state.role = claims.get("role", "analyst")
 
         return await call_next(request)
+
+
+def require_admin(request: Request) -> str:
+    """
+    Route dependency: reject non-admin callers.
+
+    The WebSocket already refuses `pause_agent` / `resume_agent` / `run_agent` from a
+    non-admin role, but the equivalent REST routes accepted any authenticated token —
+    so an analyst locked out of the dashboard buttons could pause the whole mesh with
+    one `curl`. Reads the role AuthMiddleware put on the request.
+    """
+    role = getattr(request.state, "role", None)
+    if not role:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if role != _ROLES["admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{role}' may not perform this action",
+        )
+    return role
 
 
 def create_access_token(subject: str, role: str = "analyst") -> str:
