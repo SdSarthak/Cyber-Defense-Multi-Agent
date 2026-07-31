@@ -274,7 +274,12 @@ async def websocket_endpoint(ws: WebSocket):
             except Exception:
                 pass
     except WebSocketDisconnect:
-        manager.disconnect(ws)
+        pass
     except Exception as exc:
         log.warning("websocket.error", error=str(exc))
+    finally:
+        # In a `finally`, not per-handler: a cancelled task (server shutdown, client
+        # reset) raises BaseException, which skipped both handlers and left the socket
+        # registered forever — leaking the object and pinning
+        # `websocket_connections_active` above the real connection count.
         manager.disconnect(ws)

@@ -162,3 +162,54 @@ def test_override_is_audited_on_the_event_bus(client, fake_cache):
     assert events, "override should be published for the audit trail"
     assert events[-1]["user"] == "admin"
     assert events[-1]["command"] == "set_threat_level"
+
+
+# ── Connection accounting ─────────────────────────────────────────────────────
+
+def test_connection_is_deregistered_on_clean_disconnect(client):
+    from api.websocket.manager import manager
+
+    before = manager.count
+    with client.websocket_connect(f"/ws?token={_admin_token()}") as ws:
+        ws.receive_json()
+        assert manager.count == before + 1
+    assert manager.count == before
+
+
+async def test_connection_is_deregistered_when_the_handler_is_cancelled():
+    """
+    Cancellation (server shutdown, reset peer) raises BaseException, which used to
+    skip both `except` arms — the socket stayed registered forever and the
+    `websocket_connections_active` gauge drifted above the real count.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from api.websocket.manager import manager, websocket_endpoint
+
+    before = manager.count
+    ws = MagicMock()
+    ws.query_params = {"token": _admin_token()}
+    ws.headers = {}
+    ws.accept = AsyncMock()
+    ws.send_json = AsyncMock()
+    ws.receive_text = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await websocket_endpoint(ws)
+    assert manager.count == before
+
+
+async def test_broadcast_prunes_a_socket_that_fails_to_send():
+    from unittest.mock import AsyncMock
+
+    from api.websocket.manager import ConnectionManager
+
+    mgr = ConnectionManager()
+    healthy, broken = AsyncMock(), AsyncMock()
+    broken.send_json.side_effect = RuntimeError("socket closed")
+    mgr._connections = [healthy, broken]
+
+    await mgr.broadcast({"hello": "world"})
+    assert mgr._connections == [healthy]
+    healthy.send_json.assert_awaited_once_with({"hello": "world"})
