@@ -168,8 +168,9 @@ as `admin` also enables the pause/resume buttons on the agent grid — those tra
 
 ```bash
 cd dashboard
-npm run typecheck   # tsc --noEmit
-npm run build       # production bundle into dashboard/build
+npm run typecheck        # tsc --noEmit
+CI=true npm test         # jest suite (session expiry, socket reconnect)
+npm run build            # production bundle into dashboard/build
 ```
 
 ---
@@ -235,7 +236,10 @@ curl http://localhost:8000/api/v1/agents/status \
 
 Credentials come from `ADMIN_USERNAME` / `ADMIN_PASSWORD` and `ANALYST_USERNAME` /
 `ANALYST_PASSWORD` in `.env` (defaults: `admin / admin123`, `analyst / analyst123`).
-The token carries a role: `admin` may issue agent overrides, `analyst` is read-only.
+The token carries a role: `admin` may issue agent overrides (pause, resume, run —
+over both REST and the WebSocket), `analyst` is read-only and gets 403 on those
+routes. Every list endpoint takes `?limit=`, which must be a positive integer
+within the documented ceiling; anything else is rejected with 422.
 
 `/health`, `/metrics`, `/docs` and `/api/v1/auth/*` are the only unauthenticated paths.
 
@@ -245,12 +249,12 @@ The token carries a role: `admin` may issue agent overrides, `analyst` is read-o
 | GET | `/api/v1/agents/status` | Status of all 7 agents |
 | GET | `/api/v1/agents/registry` | Agent names and descriptions |
 | GET | `/api/v1/agents/blackboard` | Shared agent blackboard state |
-| POST | `/api/v1/agents/run` | Run any agent with a payload |
-| POST | `/api/v1/agents/supervisor/run` | Route a task through the Supervisor |
+| POST | `/api/v1/agents/run` | Run any agent with a payload (admin) |
+| POST | `/api/v1/agents/supervisor/run` | Route a task through the Supervisor (admin) |
 | POST | `/api/v1/agents/{name}/pause` | Pause an agent (admin) |
 | POST | `/api/v1/agents/{name}/resume` | Resume an agent (admin) |
 | GET | `/api/v1/agents/{name}/status` | Status of one agent |
-| GET | `/api/v1/agents/{name}/history` | Agent event history |
+| GET | `/api/v1/agents/{name}/history` | Agent event history (`?limit=1..200`) |
 
 ### Threats
 | Method | Endpoint | Description |
