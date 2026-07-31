@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from enum import Enum as PyEnum
 from typing import Any
 
 import structlog
@@ -47,16 +48,29 @@ _PRIORITY_TO_SEVERITY = {
 
 # ── Coercion helpers ─────────────────────────────────────────────────────────
 
+def _enum_text(value: Any) -> str:
+    """
+    Normalise a value that may already be the enum we are coercing to.
+
+    ``str()`` on a ``(str, Enum)`` member yields "SeverityLevel.HIGH" on Python ≤3.10
+    and "high" on 3.11+, so an already-typed value round-tripped through here silently
+    became the default on one interpreter and worked on the other.
+    """
+    if isinstance(value, PyEnum):
+        value = value.value
+    return str(value or "").strip().lower()
+
+
 def coerce_severity(value: Any, default: SeverityLevel = SeverityLevel.MEDIUM) -> SeverityLevel:
     """Map free-form LLM severity text onto the SeverityLevel enum."""
-    text = str(value or "").strip().lower()
+    text = _enum_text(value)
     if text in _VALID_SEVERITIES:
         return SeverityLevel(text)
     return default
 
 
 def coerce_incident_status(value: Any, default: IncidentStatus = IncidentStatus.OPEN) -> IncidentStatus:
-    text = str(value or "").strip().lower()
+    text = _enum_text(value)
     if text in _VALID_INCIDENT_STATUSES:
         return IncidentStatus(text)
     return default
@@ -571,11 +585,13 @@ async def save_log_entries(
         return 0
     anomaly_indices = anomaly_indices or {}
     severity_score = {"critical": 1.0, "high": 0.8, "medium": 0.5, "low": 0.2}
+    written = 0
     try:
         async with AsyncSessionLocal() as session:
             for i, entry in enumerate(logs):
                 if not isinstance(entry, dict):
                     continue
+                written += 1
                 anomaly = anomaly_indices.get(i)
                 session.add(LogEntry(
                     source=_clip(entry.get("source") or "unknown", 100) or "unknown",
@@ -592,7 +608,10 @@ async def save_log_entries(
                     es_index=_clip(es_index, 100),
                 ))
             await session.commit()
-            return len(logs)
+            # Count rows actually added, not entries offered: a batch containing
+            # non-dict junk used to report every entry as stored, and the dashboard
+            # showed "Stored 20 rows" for a batch that wrote 3.
+            return written
     except Exception as exc:
         log.warning("persistence.save_log_entries_failed", error=str(exc))
         return 0
