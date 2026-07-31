@@ -23,19 +23,10 @@ def _strip_fence(text: str) -> str:
     return match.group(1) if match else text
 
 
-def _extract_balanced(text: str) -> str | None:
-    """Return the first balanced {...} or [...] block, ignoring braces inside strings."""
-    start = None
-    opener = closer = ""
-    for i, ch in enumerate(text):
-        if ch in "{[":
-            start = i
-            opener = ch
-            closer = "}" if ch == "{" else "]"
-            break
-    if start is None:
-        return None
-
+def _balanced_from(text: str, start: int) -> str | None:
+    """Return the balanced block opening at ``start``, ignoring brackets inside strings."""
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
     depth = 0
     in_string = False
     escaped = False
@@ -60,6 +51,30 @@ def _extract_balanced(text: str) -> str | None:
     return None
 
 
+def _balanced_candidates(text: str):
+    """
+    Yield every balanced {...} / [...] block in ``text``, outermost first.
+
+    Anchoring on the *first* bracket alone is not enough: models routinely preface
+    the payload with prose that contains one ("Analysis [step 1]: {...}", "use
+    {curly} braces"). That leading bracket either fails to parse or — worse — parses
+    into an unrelated value, and the agent silently records its fallback verdict.
+    Scanning every opener and letting the caller keep the first block that is valid
+    JSON recovers the real payload.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] in "{[":
+            block = _balanced_from(text, i)
+            if block is not None:
+                yield block
+                # Skip past this block: nested blocks are already inside it.
+                i += len(block)
+                continue
+        i += 1
+
+
 def parse_json_response(content: Any, default: dict | None = None) -> dict | None:
     """
     Best-effort parse of an LLM response into a dict.
@@ -73,8 +88,15 @@ def parse_json_response(content: Any, default: dict | None = None) -> dict | Non
         return default
 
     text = content if isinstance(content, str) else str(content)
+    unfenced = _strip_fence(text)
 
-    for candidate in (text, _strip_fence(text), _extract_balanced(_strip_fence(text))):
+    def _candidates():
+        yield text
+        yield unfenced
+        yield from _balanced_candidates(unfenced)
+
+    fallback: dict | None = None
+    for candidate in _candidates():
         if not candidate:
             continue
         try:
@@ -83,6 +105,9 @@ def parse_json_response(content: Any, default: dict | None = None) -> dict | Non
             continue
         if isinstance(parsed, dict):
             return parsed
-        if isinstance(parsed, list):
-            return {"items": parsed}
-    return default
+        if isinstance(parsed, list) and fallback is None:
+            # A bare array may well be a bracket in the preamble ("[step 1]"), so
+            # keep looking for an object and only fall back to the array if the
+            # rest of the text yields nothing better.
+            fallback = {"items": parsed}
+    return fallback if fallback is not None else default
