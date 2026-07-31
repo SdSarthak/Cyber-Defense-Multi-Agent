@@ -44,7 +44,10 @@ export function onSessionChange(fn: Listener): () => void {
 
 function isExpired(): boolean {
   const raw = localStorage.getItem(EXPIRY_KEY);
-  if (!raw) return false;
+  // A token with no recorded expiry is not a token this app stored — treat it as
+  // dead rather than as one that never expires, which is what a missing key used
+  // to mean.
+  if (!raw) return true;
   const expiresAt = Number(raw);
   if (!Number.isFinite(expiresAt)) return true;
   // Treat a token in its last 5 seconds as already gone; the request would land
@@ -102,13 +105,33 @@ export async function login(username: string, password: string): Promise<Session
     throw new Error(`Login failed (${res.status})`);
   }
 
-  const body: LoginResponse = await res.json();
+  let body: LoginResponse;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error("Login failed: the server did not return a token");
+  }
+
+  // Without this check a response missing `access_token` stored the literal string
+  // "undefined", so the app looked signed in while every request 401'd.
+  if (!body || typeof body.access_token !== "string" || !body.access_token) {
+    throw new Error("Login failed: the server did not return a token");
+  }
+
+  const ttlSeconds = Number(body.expires_in);
+  const validTtl = Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds : 0;
+  if (!validTtl) {
+    // An already-expired token would bounce straight back to this screen.
+    throw new Error("Login failed: the server issued an expired token");
+  }
+
+  const role = typeof body.role === "string" && body.role ? body.role : "analyst";
   localStorage.setItem(TOKEN_KEY, body.access_token);
-  localStorage.setItem(EXPIRY_KEY, String(Date.now() + body.expires_in * 1000));
-  localStorage.setItem(ROLE_KEY, body.role);
+  localStorage.setItem(EXPIRY_KEY, String(Date.now() + validTtl * 1000));
+  localStorage.setItem(ROLE_KEY, role);
   localStorage.setItem(USER_KEY, username);
 
-  const session = { token: body.access_token, role: body.role, username };
+  const session = { token: body.access_token, role, username };
   emit(session);
   return session;
 }
