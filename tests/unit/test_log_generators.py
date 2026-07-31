@@ -1,9 +1,10 @@
 """Unit tests for the SIEM log generators."""
 import pytest
+from agents.log_analysis.agent import LOG_PATTERNS
 from simulation.log_generators.generators import (
     make_normal_auth_log, make_brute_force_log, make_web_log,
     make_port_scan_log, make_data_exfil_log, make_c2_beacon_log,
-    generate_batch,
+    generate_batch, WEB_ATTACK_PAYLOADS,
 )
 
 REQUIRED_FIELDS = {"id", "timestamp", "source", "log_level", "message", "parsed_fields"}
@@ -36,7 +37,20 @@ class TestNormalLogGenerators:
         log = make_web_log(attack=True)
         _assert_log(log)
         assert log["parsed_fields"]["attack"] is True
-        assert any(kw in log["message"].lower() for kw in ["union", "script", "passwd", "or '1'"])
+        assert log["parsed_fields"]["path"] in log["message"]
+        assert log["parsed_fields"]["attack_type"] in {
+            t for _, t in WEB_ATTACK_PAYLOADS
+        }
+
+    @pytest.mark.parametrize("payload,attack_type", WEB_ATTACK_PAYLOADS)
+    def test_every_attack_payload_trips_its_detector(self, payload, attack_type):
+        """
+        The generator labels each payload with the technique it represents, and the
+        log-analysis agent keys on exactly those names. Asserting on a hand-written
+        keyword list instead let `/admin?cmd=ls+-la;id` through — one payload in five,
+        so the suite failed at random rather than never.
+        """
+        assert LOG_PATTERNS[attack_type].search(payload), payload
 
 
 class TestAttackLogGenerators:

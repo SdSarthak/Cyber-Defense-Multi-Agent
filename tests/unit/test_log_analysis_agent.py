@@ -64,6 +64,33 @@ async def test_pattern_scan_detects_sql_injection(log_agent):
     assert "sql_injection" in result["pattern_hits"]
 
 
+@pytest.mark.parametrize("payload", [
+    "/login?user=admin&pass=' OR '1'='1",
+    "/search?q=' OR 1=1--",
+    "admin' OR 'a'='a",
+    'GET /?id=1 OR "x"="x"',
+])
+async def test_pattern_scan_detects_quoted_tautologies(log_agent, payload):
+    """
+    `or\\s+1=1` only matched the unquoted form, so `' OR '1'='1` — the textbook
+    payload, and one the project's own simulator emits — reached the LLM with no
+    pre-detected pattern hit at all.
+    """
+    result = await log_agent.run({"logs": [{"message": payload}]})
+    assert "sql_injection" in result["pattern_hits"]
+
+
+@pytest.mark.parametrize("benign", [
+    "Accepted password for ubuntu from 10.0.1.5 port 22 ssh2",
+    "connection refused or timeout=30",
+    "job finished or retries=0",
+    "user selected union membership options",
+])
+async def test_pattern_scan_does_not_flag_ordinary_prose(log_agent, benign):
+    result = await log_agent.run({"logs": [{"message": benign}]})
+    assert "sql_injection" not in result["pattern_hits"]
+
+
 async def test_pattern_scan_detects_path_traversal(log_agent):
     logs = [{"message": "GET /../../../etc/passwd"}]
     result = await log_agent.run({"logs": logs})

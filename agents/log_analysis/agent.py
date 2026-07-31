@@ -15,7 +15,15 @@ from core.parsing import parse_json_response
 
 LOG_PATTERNS = {
     "brute_force": re.compile(r"(failed (password|login)|authentication failure|invalid (user|password))", re.I),
-    "sql_injection": re.compile(r"(union\s+select|or\s+1=1|drop\s+table|xp_cmdshell|'--)", re.I),
+    # `or\s+1=1` alone missed the most common form of the tautology, the quoted
+    # `' OR '1'='1` — including the payload this project's own simulator emits, which
+    # therefore sailed past the pre-detector. The backreference requires both operands
+    # to be the same token, which is the tautology signature and keeps ordinary prose
+    # containing "or x=y" out of the results.
+    "sql_injection": re.compile(
+        r"(union\s+select|\bor\s+['\"]?(\w+)['\"]?\s*=\s*['\"]?\2\b|drop\s+table|xp_cmdshell|'--)",
+        re.I,
+    ),
     "xss": re.compile(r"(<script|javascript:|onerror=|onload=)", re.I),
     "path_traversal": re.compile(r"(\.\./|\.\.\\|%2e%2e%2f)", re.I),
     "command_injection": re.compile(r"(;(ls|cat|id|whoami|wget|curl)|&&(ls|id)|`id`)", re.I),
