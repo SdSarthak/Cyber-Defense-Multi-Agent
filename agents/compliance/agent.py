@@ -1,12 +1,14 @@
 """Compliance Agent — continuous control evaluation against SOC2, ISO 27001, NIST CSF."""
 from __future__ import annotations
 import json
+import uuid
 from typing import TypedDict, Annotated
 import operator
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
+from core.config import settings
 from core.rag import rag_chain
 from core.database import repository
 from core.parsing import parse_json_response
@@ -40,6 +42,105 @@ FRAMEWORKS = {
     },
 }
 
+# Which slice of platform telemetry speaks to each control. Controls the platform has
+# no data for get an explicit "not collected" marker instead of an empty object.
+CONTROL_EVIDENCE = {
+    "SOC2": {
+        "CC6.1": "access", "CC6.2": "access", "CC6.3": "access",
+        "CC7.1": "monitoring", "CC7.2": "monitoring", "A1.1": "availability",
+    },
+    "NIST_CSF": {
+        "PR.AC-1": "access", "DE.CM-1": "monitoring", "DE.CM-7": "monitoring",
+        "RS.RP-1": "incident_response",
+    },
+    "ISO27001": {
+        "A.9.1.1": "access", "A.9.4.1": "access", "A.12.4.1": "monitoring",
+        "A.12.6.1": "vulnerability", "A.16.1.1": "incident_response",
+        "A.16.1.2": "incident_response",
+    },
+}
+
+VALID_STATUSES = ("pass", "fail", "partial", "na")
+
+
+async def collect_platform_evidence() -> dict[str, dict]:
+    """
+    Evidence the SOC platform can attest to from its own configuration and records.
+
+    Compliance evaluation used to judge every control against ``{}`` unless the caller
+    hand-supplied evidence, so the dashboard's scores were the model's guesses.
+    """
+    log_stats = await repository.log_stats(hours=24)
+    severity_counts = await repository.threat_severity_counts(hours=24)
+    incidents = await repository.incident_metrics(hours=24 * 30)
+    vulns = await repository.list_vulnerabilities(limit=200)
+    registry = await repository.list_agent_registry()
+
+    weak_passwords = [
+        name for name, pw in (
+            (settings.admin_username, settings.admin_password),
+            (settings.analyst_username, settings.analyst_password),
+        ) if settings.insecure_password(pw)
+    ]
+    return {
+        "access": {
+            "authentication": "JWT bearer token required on every /api/v1 route and the /ws socket",
+            "roles": {"admin": "full control", "analyst": "read-only"},
+            "websocket_auth_required": settings.websocket_auth_required,
+            "signing_key_is_default": settings.insecure_secret_key(),
+            "accounts_with_default_or_weak_passwords": weak_passwords,
+            "insecure_defaults_allowed": settings.allow_insecure_defaults,
+            "login_lockout": {
+                "max_failures": settings.login_max_failures,
+                "lockout_seconds": settings.login_lockout_seconds,
+            },
+            "token_lifetime_minutes": settings.api_access_token_expire_minutes,
+        },
+        "monitoring": {
+            "log_analysis_last_24h": log_stats or "persistence disabled — no log volume recorded",
+            "threat_detections_last_24h_by_severity": severity_counts,
+            "log_search_backend": "elasticsearch" if settings.elasticsearch_enabled else "disabled",
+            "metrics_endpoint": "/metrics (Prometheus)",
+            "agents": [
+                {k: a.get(k) for k in ("agent_name", "status", "last_heartbeat", "tasks_completed", "tasks_failed")}
+                for a in registry
+            ],
+        },
+        "availability": {
+            "persistence_enabled": settings.enable_persistence,
+            "agent_heartbeats_recorded": len(registry),
+        },
+        "vulnerability": {
+            "known_vulnerabilities": len(vulns),
+            "critical_or_high": sum(1 for v in vulns if v.get("severity") in ("critical", "high")),
+            "open_remediations": sum(1 for v in vulns if v.get("remediation_status") in ("open", "urgent")),
+            "scheduled_scan_targets": len(settings.split_csv(settings.vuln_scan_targets)),
+            "scan_interval_seconds": settings.vuln_scan_interval,
+        },
+        "incident_response": {
+            "incidents_last_30d": incidents,
+            "playbooks": ["brute_force", "ransomware", "data_exfiltration", "c2_beacon", "sql_injection", "default"],
+            "containment_mode": settings.containment_mode,
+            "containment_requires_approval": settings.containment_require_approval,
+        },
+    }
+
+
+def _evidence_for(framework: str, control_id: str, platform: dict, provided: dict) -> dict:
+    category = CONTROL_EVIDENCE.get(framework, {}).get(control_id)
+    evidence: dict = {}
+    if category and category in platform:
+        evidence["platform"] = platform[category]
+    else:
+        evidence["platform"] = {
+            "collected": False,
+            "note": "The platform records no telemetry for this control; supply evidence via the API.",
+        }
+    if control_id in provided:
+        evidence["provided"] = provided[control_id]
+    return evidence
+
+
 def _as_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -67,8 +168,9 @@ class ComplianceState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
     framework: str
     evidence: dict
+    evaluation_id: str
     control_results: list[dict]
-    overall_score: float
+    overall_score: float | None
     failed_controls: list[str]
     summary: str
 
@@ -95,9 +197,14 @@ class ComplianceAgent(BaseSecurityAgent):
     async def _evaluate_controls(self, state: ComplianceState) -> dict:
         framework = state["framework"]
         controls = FRAMEWORKS.get(framework, {})
-        evidence = state["evidence"] if isinstance(state["evidence"], dict) else {}
+        provided = state["evidence"] if isinstance(state["evidence"], dict) else {}
+        try:
+            platform = await collect_platform_evidence()
+        except Exception:
+            platform = {}
         results = []
         for control_id, control_name in controls.items():
+            evidence = _evidence_for(framework, control_id, platform, provided)
             policy_ctx = await rag_chain.compliance_rag.ainvoke(
                 f"{framework} {control_id} {control_name} compliance requirements"
             )
@@ -107,14 +214,30 @@ class ComplianceAgent(BaseSecurityAgent):
                 "framework": framework,
                 "control_id": control_id,
                 "control_name": control_name,
-                "evidence": json.dumps(evidence.get(control_id, {}), default=str),
-                "policy_context": policy_ctx,
+                "evidence": json.dumps(evidence, default=str)[:6000],
+                "policy_context": policy_ctx or "(no policy context available)",
             })
-            result = parse_json_response(resp.content) or {
-                "status": "partial", "score": 50.0, "findings": [], "remediation": "",
-            }
+            parsed = parse_json_response(resp.content)
+            if parsed is None:
+                # No verdict is not a 50% verdict: the old fallback invented a score.
+                result = {
+                    "status": "na", "score": None, "evidence_quality": "none",
+                    "findings": ["The evaluation response could not be parsed"],
+                    "remediation": "", "risk_if_failed": None,
+                }
+            else:
+                result = dict(parsed)
+                status = str(result.get("status") or "").strip().lower()
+                result["status"] = status if status in VALID_STATUSES else "partial"
+                score = result.get("score")
+                result["score"] = (
+                    max(0.0, min(100.0, _as_float(score))) if score is not None else None
+                )
+                if result.get("risk_if_failed"):
+                    result["risk_if_failed"] = str(result["risk_if_failed"]).strip().lower()
             result["control_id"] = control_id
             result["control_name"] = control_name
+            result["evidence"] = evidence
             results.append(result)
         return {
             "control_results": results,
@@ -129,13 +252,13 @@ class ComplianceAgent(BaseSecurityAgent):
                 "failed_controls": [],
                 "messages": [AIMessage(content="No controls defined for this framework")],
             }
-        scores = [_as_float(r.get("score")) for r in results]
-        overall = sum(scores) / len(scores)
+        scores = [_as_float(r.get("score")) for r in results if r.get("score") is not None]
+        overall = round(sum(scores) / len(scores), 1) if scores else None
         failed = [r["control_id"] for r in results if r.get("status") == "fail"]
         return {
-            "overall_score": round(overall, 1),
+            "overall_score": overall,
             "failed_controls": failed,
-            "messages": [AIMessage(content=f"Overall compliance score: {overall:.1f}% | Failed: {len(failed)}")],
+            "messages": [AIMessage(content=f"Overall compliance score: {overall}% | Failed: {len(failed)}")],
         }
 
     async def _generate_findings(self, state: ComplianceState) -> dict:
@@ -145,7 +268,9 @@ class ComplianceAgent(BaseSecurityAgent):
         ]
 
         # Persist the control-by-control verdict so posture can be trended over time.
-        await repository.save_compliance_results(state["framework"], state["control_results"])
+        await repository.save_compliance_results(
+            state["framework"], state["control_results"], evaluation_id=state["evaluation_id"]
+        )
 
         if critical_failures:
             await self.escalate({
@@ -156,8 +281,9 @@ class ComplianceAgent(BaseSecurityAgent):
                 "overall_score": state["overall_score"],
             })
 
+        score = state["overall_score"]
         summary = (
-            f"{state['framework']} compliance: {state['overall_score']}% | "
+            f"{state['framework']} compliance: {score if score is not None else 'n/a'}% | "
             f"Failed controls: {len(state['failed_controls'])} | "
             f"Critical gaps: {len(critical_failures)}"
         )
@@ -178,14 +304,16 @@ class ComplianceAgent(BaseSecurityAgent):
             "messages": [HumanMessage(content=f"Evaluate {framework} compliance")],
             "framework": framework,
             "evidence": evidence,
+            "evaluation_id": str(uuid.uuid4()),
             "control_results": [],
-            "overall_score": 0.0,
+            "overall_score": None,
             "failed_controls": [],
             "summary": "",
         }
         final = await self._graph.ainvoke(initial)
         return {
             "framework": framework,
+            "evaluation_id": final["evaluation_id"],
             "control_results": final["control_results"],
             "overall_score": final["overall_score"],
             "failed_controls": final["failed_controls"],

@@ -35,6 +35,9 @@ class FakeRedisCache:
         self.lists: dict[str, list] = {}
         self.hashes: dict[str, dict] = {}
         self.published: list[tuple[str, dict]] = []
+        self.ttls: dict[str, int] = {}
+        self.streams: dict[str, list] = {}
+        self.groups: dict[tuple[str, str], dict] = {}
 
     def _roundtrip(self, value):
         """Match real Redis semantics: values are JSON-serialised on the way in."""
@@ -42,6 +45,10 @@ class FakeRedisCache:
 
     async def set(self, key, value, ttl=3600):
         self.store[key] = self._roundtrip(value)
+        if ttl is None:
+            self.ttls.pop(key, None)
+        else:
+            self.ttls[key] = ttl
 
     async def get(self, key):
         return self.store.get(key)
@@ -95,6 +102,40 @@ class FakeRedisCache:
     async def hgetall(self, name):
         return dict(self.hashes.get(name, {}))
 
+    async def incr_window(self, key, ttl):
+        return await self.incr(key)
+
+    # Streams (enough of XADD / consumer groups for the escalation queue) -------
+
+    async def xadd(self, stream, value, maxlen=10_000):
+        entries = self.streams.setdefault(stream, [])
+        entry_id = f"{len(entries) + 1}-0"
+        entries.append((entry_id, self._roundtrip(value)))
+        return entry_id
+
+    async def ensure_group(self, stream, group):
+        self.streams.setdefault(stream, [])
+        self.groups.setdefault((stream, group), {"next": 0, "pending": {}})
+
+    async def xreadgroup(self, stream, group, consumer, count=10, block_ms=5000):
+        await self.ensure_group(stream, group)
+        state = self.groups[(stream, group)]
+        entries = self.streams[stream][state["next"]:state["next"] + count]
+        state["next"] += len(entries)
+        for entry_id, value in entries:
+            state["pending"][entry_id] = (consumer, value)
+        return list(entries)
+
+    async def xautoclaim(self, stream, group, consumer, min_idle_ms, count=10):
+        await self.ensure_group(stream, group)
+        pending = self.groups[(stream, group)]["pending"]
+        return [(entry_id, value) for entry_id, (_, value) in list(pending.items())[:count]]
+
+    async def xack(self, stream, group, *ids):
+        pending = self.groups.get((stream, group), {}).get("pending", {})
+        for entry_id in ids:
+            pending.pop(entry_id, None)
+
     # Test helpers ------------------------------------------------------------
 
     def messages_on(self, channel: str) -> list[dict]:
@@ -108,6 +149,14 @@ def isolate_backends(monkeypatch):
     monkeypatch.setattr(settings, "elasticsearch_enabled", False)
     monkeypatch.setattr(settings, "rag_enabled", False)
     monkeypatch.setattr(settings, "agent_timeout_seconds", 30)
+    # Throttles that exist for production are exercised by their own tests; elsewhere
+    # they would only make the suite slow (NVD) or flaky (per-minute write budget).
+    monkeypatch.setattr(settings, "api_write_rate_limit_per_minute", 0)
+
+    async def _no_wait():
+        return None
+
+    monkeypatch.setattr("core.tools.threat_tools._nvd_limiter.acquire", _no_wait)
 
 
 @pytest.fixture(autouse=True)

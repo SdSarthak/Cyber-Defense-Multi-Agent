@@ -6,11 +6,20 @@ Threat intel tools — zero external API keys required.
 - Port scan     : direct async TCP probe
 """
 import asyncio
+import collections
 import json
 import ipaddress
+import time
+
 import aiohttp
+import structlog
 from ipwhois import IPWhois
 from langchain_core.tools import tool
+
+from core.config import settings
+from core.database import redis_client
+
+log = structlog.get_logger()
 
 # Known malicious/high-risk ASNs (Tor exit nodes, bulletproof hosters)
 _SUSPICIOUS_ASNS = {
@@ -18,12 +27,20 @@ _SUSPICIOUS_ASNS = {
     "AS16276", "AS14061", "AS51167", "AS202425", "AS209588",
 }
 
+# Internal / non-routable space. Deliberately *not* `ip_address().is_private`, which
+# also covers the documentation ranges (198.51.100.0/24, 203.0.113.0/24) that the
+# simulator uses to stand in for external attackers.
 _PRIVATE_RANGES = [
+    ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),     # carrier-grade NAT
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),           # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),          # IPv6 link local
 ]
 
 _RISK_PORTS = {
@@ -45,12 +62,40 @@ _HIGH_RISK_COUNTRIES = ("RU", "CN", "KP", "IR", "BY")
 _HIGH_RISK_ORG_KEYWORDS = ("HOSTING", "VPN", "TOR", "BULLETPROOF", "ANONYMOUS")
 
 
+def _unmap(addr):
+    """Treat ::ffff:10.0.0.1 as the IPv4 address it wraps."""
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped or addr
+
+
 def _is_private(ip: str) -> bool:
     try:
-        addr = ipaddress.ip_address(ip)
-        return any(addr in net for net in _PRIVATE_RANGES)
+        addr = _unmap(ipaddress.ip_address(ip))
     except ValueError:
         return False
+    return any(addr.version == net.version and addr in net for net in _PRIVATE_RANGES)
+
+
+def _scan_refusal(ip: str) -> str | None:
+    """
+    Why ``ip`` may not be probed, or None when it may.
+
+    Loopback, link-local (which includes the 169.254.169.254 cloud metadata service),
+    multicast and reserved space are never scanned. When SCAN_ALLOWED_NETWORKS is set,
+    only addresses inside it are.
+    """
+    addr = _unmap(ipaddress.ip_address(ip))
+    if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+        return "address class is never scanned (loopback, link-local, multicast or reserved)"
+    allowed = []
+    for cidr in settings.split_csv(settings.scan_allowed_networks):
+        try:
+            allowed.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            log.warning("scan.invalid_allowed_network", cidr=cidr)
+    if allowed and not any(addr.version == n.version and addr in n for n in allowed):
+        return "outside SCAN_ALLOWED_NETWORKS"
+    return None
 
 
 def _rdap_lookup(ip: str) -> dict:
@@ -183,15 +228,78 @@ def _english_description(cve: dict) -> str:
     return ""
 
 
+NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_WINDOW_SECONDS = 30.0
+
+
+class _NvdLimiter:
+    """
+    NVD allows 5 requests per rolling 30s without an API key and 50 with one. The
+    vulnerability agent fetched up to 10 CVEs back to back, so everything after the
+    fifth came back as a 403 that was then analysed as if it were CVE data.
+
+    State is per event loop: the API runs one loop, and tests get a fresh window each.
+    """
+
+    def __init__(self):
+        self._loop = None
+        self._lock: asyncio.Lock | None = None
+        self._stamps: collections.deque = collections.deque()
+
+    @staticmethod
+    def limit() -> int:
+        return 50 if settings.nvd_api_key else 5
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._loop, self._lock, self._stamps = loop, asyncio.Lock(), collections.deque()
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                while self._stamps and now - self._stamps[0] >= NVD_WINDOW_SECONDS:
+                    self._stamps.popleft()
+                if len(self._stamps) < self.limit():
+                    self._stamps.append(now)
+                    return
+                await asyncio.sleep(NVD_WINDOW_SECONDS - (now - self._stamps[0]) + 0.05)
+
+
+_nvd_limiter = _NvdLimiter()
+
+
+async def _nvd_cache_get(cve_id: str) -> str | None:
+    try:
+        cached = await redis_client.cache.get(f"nvd:cve:{cve_id.upper()}")
+    except Exception:
+        return None
+    return json.dumps(cached) if isinstance(cached, dict) else None
+
+
+async def _nvd_cache_put(cve_id: str, record: dict) -> None:
+    try:
+        await redis_client.cache.set(
+            f"nvd:cve:{cve_id.upper()}", record, ttl=settings.nvd_cache_ttl_seconds
+        )
+    except Exception:
+        pass
+
+
 @tool
 async def get_nvd_cve(cve_id: str) -> str:
-    """Fetch CVE details from the NIST NVD REST API (public, no key required)."""
+    """Fetch CVE details from the NIST NVD REST API (cached; NVD_API_KEY optional)."""
     if not isinstance(cve_id, str) or not cve_id.strip():
         return json.dumps({"error": "no CVE id supplied", "cve_id": cve_id})
     cve_id = cve_id.strip()
-    url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    cached = await _nvd_cache_get(cve_id)
+    if cached:
+        return cached
+
+    await _nvd_limiter.acquire()
+    url = NVD_URL
+    headers = {"apiKey": settings.nvd_api_key} if settings.nvd_api_key else {}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(
                 url, params={"cveId": cve_id}, timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
@@ -230,7 +338,7 @@ async def get_nvd_cve(cve_id: str) -> str:
 
     metric = _first_metric(cve.get("metrics"))
     cvss = metric.get("cvssData") or {}
-    return json.dumps({
+    record = {
         "cve_id": cve.get("id") or cve_id,
         "description": _english_description(cve),
         "cvss_score": cvss.get("baseScore"),
@@ -239,15 +347,16 @@ async def get_nvd_cve(cve_id: str) -> str:
         "severity": cvss.get("baseSeverity") or metric.get("baseSeverity"),
         "vector": cvss.get("vectorString"),
         "published": cve.get("published"),
-    })
+    }
+    await _nvd_cache_put(cve_id, record)
+    return json.dumps(record)
 
 
 @tool
 async def scan_asset_ports(ip: str) -> str:
     """Light async TCP port probe on common security-relevant ports. No external APIs needed."""
-    # The target comes out of LLM output, so restrict it to a literal address: a
-    # hostname here would turn the tool into an arbitrary-host connector (and a DNS
-    # lookup for an attacker-chosen name).
+    # Restrict the target to a literal address: a hostname here would turn the tool
+    # into an arbitrary-host connector (and a DNS lookup for a caller-chosen name).
     if not isinstance(ip, str):
         return json.dumps({"ip": ip, "error": "not an IP address", "risk_level": "unknown"})
     ip = ip.strip()
@@ -255,6 +364,9 @@ async def scan_asset_ports(ip: str) -> str:
         ipaddress.ip_address(ip)
     except ValueError:
         return json.dumps({"ip": ip, "error": "not an IP address", "risk_level": "unknown"})
+    refusal = _scan_refusal(ip)
+    if refusal:
+        return json.dumps({"ip": ip, "error": f"scan refused: {refusal}", "risk_level": "unknown"})
 
     open_ports: list[int] = []
 

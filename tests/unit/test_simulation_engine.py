@@ -59,9 +59,29 @@ class TestQueueBound:
         assert await fake_cache.llen(LOG_QUEUE_KEY) == 1
 
 
+@pytest.fixture
+def inject_escalations(monkeypatch):
+    from core.config import settings
+    monkeypatch.setattr(settings, "simulation_inject_escalations", True)
+
+
 class TestScenarioInjection:
+    async def test_scenarios_leave_escalation_to_the_detectors_by_default(self, fake_cache):
+        """Incidents must come from detection catching the attack, not the simulator."""
+        engine = SimulationEngine()
+        await engine._inject_sql_injection_attack()
+        assert await fake_cache.llen(LOG_QUEUE_KEY) == 3
+        assert fake_cache.messages_on("escalations") == []
+        assert "escalations:stream" not in fake_cache.streams
+
+    async def test_injected_logs_are_timestamped(self, fake_cache):
+        engine = SimulationEngine()
+        await engine._inject_sql_injection_attack()
+        queued = await fake_cache.lrange(LOG_QUEUE_KEY, 0, -1)
+        assert all(e.get("timestamp") for e in queued)
+
     async def test_apt_scenario_does_not_idle_after_the_last_stage(
-        self, fake_cache, monkeypatch
+        self, fake_cache, monkeypatch, inject_escalations
     ):
         monkeypatch.setattr(sim_engine, "APT_STAGE_DELAY_SECONDS", 0.05)
         engine = SimulationEngine()
@@ -78,12 +98,14 @@ class TestScenarioInjection:
         assert escalations[0]["threat_type"] == "apt_campaign"
 
     async def test_brute_force_campaign_is_capped_like_everything_else(
-        self, fake_cache, small_queue
+        self, fake_cache, small_queue, inject_escalations
     ):
         engine = SimulationEngine()
         await engine._inject_brute_force_campaign()
         assert await fake_cache.llen(LOG_QUEUE_KEY) == small_queue
         assert len(fake_cache.messages_on("escalations")) == 1
+        # Injected escalations take the same durable path as agent escalations.
+        assert len(fake_cache.streams["escalations:stream"]) == 1
 
     async def test_sql_injection_scenario_queues_every_payload(self, fake_cache):
         engine = SimulationEngine()

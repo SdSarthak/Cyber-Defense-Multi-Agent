@@ -100,11 +100,18 @@ async def index_logs(logs: list[dict], anomaly_indices: dict[int, dict] | None =
         return 0
 
 
-async def search_logs(query: str | None = None, limit: int = 50, anomalous_only: bool = False) -> list[dict]:
-    """Free-text search across indexed logs. Returns [] when Elasticsearch is down."""
+async def search_logs(
+    query: str | None = None, limit: int = 50, anomalous_only: bool = False
+) -> list[dict] | None:
+    """
+    Free-text search across indexed logs, newest first.
+
+    Returns None when Elasticsearch is disabled or the search fails, so callers can
+    tell "no matches" apart from "search unavailable".
+    """
     client = get_es_client()
     if client is None:
-        return []
+        return None
 
     filters: list[dict] = []
     if anomalous_only:
@@ -113,17 +120,18 @@ async def search_logs(query: str | None = None, limit: int = 50, anomalous_only:
     if query:
         must.append({"multi_match": {"query": query, "fields": ["message", "source", "host", "service"]}})
 
-    body = {
-        "size": limit,
-        "sort": [{"@timestamp": {"order": "desc"}}],
-        "query": {"bool": {"must": must or [{"match_all": {}}], "filter": filters}},
-    }
     try:
-        response = await client.search(index=settings.elasticsearch_log_index, body=body)
+        response = await client.search(
+            index=settings.elasticsearch_log_index,
+            size=limit,
+            sort=[{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
+            query={"bool": {"must": must or [{"match_all": {}}], "filter": filters}},
+            ignore_unavailable=True,
+        )
         return [hit["_source"] for hit in response["hits"]["hits"]]
     except Exception as exc:
         log.warning("elasticsearch.search_logs_failed", error=str(exc))
-        return []
+        return None
 
 
 async def close_es_client() -> None:

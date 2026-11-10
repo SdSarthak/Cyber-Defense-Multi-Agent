@@ -18,6 +18,7 @@ from tests.conftest import FakeRedisCache, make_llm
 CACHE_METHODS = (
     "set", "get", "delete", "exists", "expire", "publish", "lpush", "rpop",
     "lrange", "ltrim", "llen", "incr", "set_if_absent", "hset", "hgetall",
+    "incr_window", "xadd", "ensure_group", "xreadgroup", "xautoclaim", "xack",
 )
 
 
@@ -117,16 +118,16 @@ class TestLogGeneratorStress:
 
 class TestAgentMemoryStress:
     @pytest.mark.asyncio
-    async def test_concurrent_remember_recall(self, monkeypatch):
+    async def test_concurrent_history_writes_stay_per_agent(self, monkeypatch):
         cache, store = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
         from core.memory.agent_memory import AgentMemory
 
         async def worker(i: int):
             mem = AgentMemory(f"agent_{i}")
-            await mem.remember(f"key_{i}", {"data": i * 100})
-            result = await mem.recall(f"key_{i}")
-            assert result == {"data": i * 100}
+            await mem.log_event({"type": "tick", "data": i * 100})
+            history = await mem.get_history(limit=5)
+            assert [e["data"] for e in history] == [i * 100]
 
         await asyncio.gather(*[worker(i) for i in range(50)])
 
@@ -365,6 +366,8 @@ class TestEndToEndPipelineStress:
     async def test_attack_scenario_injection(self, monkeypatch):
         cache, store = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
+        # Scenario escalations are opt-in; detection agents raise them by default.
+        monkeypatch.setattr(settings, "simulation_inject_escalations", True)
         from simulation.engine import SimulationEngine
 
         engine = SimulationEngine()
@@ -378,6 +381,8 @@ class TestEndToEndPipelineStress:
     async def test_apt_scenario_multi_stage(self, monkeypatch):
         cache, store = make_fast_cache()
         monkeypatch.setattr("core.database.redis_client.cache", cache)
+        # Scenario escalations are opt-in; detection agents raise them by default.
+        monkeypatch.setattr(settings, "simulation_inject_escalations", True)
         from simulation.engine import SimulationEngine
 
         engine = SimulationEngine()
@@ -419,7 +424,7 @@ class TestFailureInjection:
         # Turn retrieval back on (conftest disables it) so the failure path is reached.
         monkeypatch.setattr(settings, "rag_enabled", True)
         monkeypatch.setattr(
-            "core.rag.rag_chain.build_rag_chain",
+            "core.rag.rag_chain.build_retriever",
             MagicMock(side_effect=Exception("Chroma unavailable")),
         )
         with patch("langchain_google_genai.ChatGoogleGenerativeAI") as MockLLM:

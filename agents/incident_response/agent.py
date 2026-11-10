@@ -8,7 +8,8 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from agents.base_agent import BaseSecurityAgent
-from core import metrics
+from core import containment, metrics
+from core.config import settings
 from core.database import redis_client, repository
 from core.parsing import parse_json_response
 
@@ -84,6 +85,7 @@ class IRState(TypedDict):
     playbook_name: str
     response_plan: dict
     actions_taken: list[dict]
+    threat_event_ids: list
     incident_id: str | None
     summary: str
 
@@ -136,11 +138,14 @@ class IncidentResponseAgent(BaseSecurityAgent):
             "assessment": json.dumps(state["threat_assessment"], default=str),
         })
 
-        fallback_id = state["incident"].get("id") or str(uuid.uuid4())
+        # The id is ours to assign: the caller's when it supplied one, otherwise a fresh
+        # UUID. The LLM's own "incident_id" used to win, and model-invented ids like
+        # "INC-001" collided and overwrote each other in Redis.
+        incident_id = str(state["incident"].get("id") or uuid.uuid4())
         plan = parse_json_response(resp.content)
         if plan is None:
             plan = {
-                "incident_id": fallback_id,
+                "incident_id": incident_id,
                 "playbook": state["playbook_name"],
                 "priority": "p2",
                 "containment_actions": [
@@ -154,39 +159,61 @@ class IncidentResponseAgent(BaseSecurityAgent):
             }
         else:
             plan.setdefault("playbook", state["playbook_name"])
-            if not plan.get("incident_id"):
-                plan["incident_id"] = fallback_id
-            if not plan.get("containment_actions"):
+            if plan.get("incident_id") and plan["incident_id"] != incident_id:
+                plan["llm_reference"] = plan["incident_id"]
+            plan["incident_id"] = incident_id
+            if not isinstance(plan.get("containment_actions"), list) or not plan.get("containment_actions"):
                 plan["containment_actions"] = [
                     {"action": s, "automated": False, "status": "pending"} for s in playbook_steps
                 ]
 
-        metrics.incidents_total.labels(playbook=str(plan.get("playbook", "default"))).inc()
+        # Label by the playbook we selected, not the free-text one the model wrote.
+        metrics.incidents_total.labels(playbook=state["playbook_name"]).inc()
         return {"response_plan": plan,
                 "messages": [AIMessage(content=f"Response plan built: {plan.get('priority')} priority")]}
 
     async def _execute_containment(self, state: IRState) -> dict:
+        """
+        Run (or queue for approval) the automated containment actions.
+
+        With CONTAINMENT_REQUIRE_APPROVAL the actions wait for an admin; otherwise they
+        go to the configured executor, which reports "simulated" rather than
+        "completed" when no real integration is configured.
+        """
         actions_taken = []
+        awaiting = 0
         for action in state["response_plan"].get("containment_actions", []):
-            if isinstance(action, dict) and action.get("automated"):
-                result = await self._simulate_action(str(action.get("action", "")), state["incident"])
-                action["status"] = "completed" if result["success"] else "failed"
-                action["result"] = result
-                actions_taken.append(action)
+            if not (isinstance(action, dict) and action.get("automated")):
+                continue
+            if settings.containment_require_approval:
+                action["status"] = containment.PENDING_APPROVAL
+                awaiting += 1
+                continue
+            result = await containment.execute(str(action.get("action", "")), state["incident"])
+            action["status"] = result["status"]
+            action["result"] = result
+            actions_taken.append(action)
         await self._safe_publish("incident_updates", {
             "agent": self.name,
             "incident_id": state["response_plan"].get("incident_id"),
             "actions_taken": len(actions_taken),
+            "awaiting_approval": awaiting,
             "plan": state["response_plan"],
         })
         return {"actions_taken": actions_taken,
-                "messages": [AIMessage(content=f"Executed {len(actions_taken)} automated containment actions")]}
+                "messages": [AIMessage(content=(
+                    f"Executed {len(actions_taken)} automated containment actions, "
+                    f"{awaiting} awaiting approval"
+                ))]}
 
     async def _update_incident(self, state: IRState) -> dict:
         plan = state["response_plan"]
 
         # PostgreSQL is the durable record; the Redis copy backs the live dashboard.
-        db_id = await repository.save_incident(state["incident"], plan, state["actions_taken"])
+        db_id = await repository.save_incident(
+            state["incident"], plan, state["actions_taken"],
+            threat_event_ids=state.get("threat_event_ids") or [],
+        )
         incident_id = db_id or plan.get("incident_id")
         plan["incident_id"] = incident_id
 
@@ -196,6 +223,8 @@ class IncidentResponseAgent(BaseSecurityAgent):
             "actions_taken": state["actions_taken"],
             "playbook": state["playbook_name"],
             "status": "investigating",
+            "title": state["incident"].get("title", ""),
+            "severity": state["incident"].get("severity"),
         }
         try:
             await redis_client.cache.set(f"incident:{incident_id}", record, ttl=86400)
@@ -209,25 +238,25 @@ class IncidentResponseAgent(BaseSecurityAgent):
         except Exception:
             pass
 
+        awaiting = sum(
+            1 for a in plan.get("containment_actions", [])
+            if isinstance(a, dict) and a.get("status") == containment.PENDING_APPROVAL
+        )
         summary = (
             f"Incident {incident_id or 'N/A'} | "
             f"Playbook: {state['playbook_name']} | "
             f"Priority: {plan.get('priority')} | "
-            f"Actions: {len(state['actions_taken'])} automated"
+            f"Actions: {len(state['actions_taken'])} run, {awaiting} awaiting approval"
         )
         return {"incident_id": incident_id, "summary": summary,
                 "messages": [AIMessage(content=summary)]}
-
-    @staticmethod
-    async def _simulate_action(action: str, incident: dict) -> dict:
-        """In simulation mode, mark actions as completed. In production, integrate SOAR/firewall APIs."""
-        return {"success": True, "action": action, "note": "simulated"}
 
     async def run(self, input_data: dict) -> dict:
         incident = input_data.get("incident") or {}
         if not isinstance(incident, dict):
             incident = {"title": str(incident)}
         threat_assessment = input_data.get("threat_assessment") or {}
+        event_ids = input_data.get("threat_event_ids") or []
         initial: IRState = {
             "messages": [HumanMessage(content=f"Respond to incident: {json.dumps(incident, default=str)[:200]}")],
             "incident": incident,
@@ -235,6 +264,7 @@ class IncidentResponseAgent(BaseSecurityAgent):
             "playbook_name": "default",
             "response_plan": {},
             "actions_taken": [],
+            "threat_event_ids": [e for e in event_ids if e] if isinstance(event_ids, list) else [],
             "incident_id": None,
             "summary": "",
         }

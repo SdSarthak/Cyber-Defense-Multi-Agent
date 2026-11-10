@@ -13,6 +13,9 @@ import { AgentStatusGrid } from "./components/AgentStatus/AgentStatusGrid";
 import { AlertFeed } from "./components/AlertFeed/AlertFeed";
 import { IncidentPanel } from "./components/IncidentPanel/IncidentPanel";
 import { ComplianceView } from "./components/ComplianceView/ComplianceView";
+import { VulnerabilityPanel } from "./components/Vulnerabilities/VulnerabilityPanel";
+import { ReportsPanel } from "./components/Reports/ReportsPanel";
+import { LogSearchPanel } from "./components/LogSearch/LogSearchPanel";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -28,6 +31,9 @@ const queryClient = new QueryClient({
 function SOCDashboard({ username, role }: { username: string; role: string }) {
   const { sendOverride, lastOverride } = useWebSocket();
   useSocData();
+  // Every mutating API call (and every socket override) is admin-only on the server;
+  // analysts get the same views with the write controls disabled.
+  const canWrite = role === "admin";
 
   function signOut() {
     // Drop cached responses too, so the next operator never sees stale data.
@@ -75,7 +81,7 @@ function SOCDashboard({ username, role }: { username: string; role: string }) {
           <AlertChart />
           <ThreatSeverityPanel />
           <AgentStatusGrid
-            canOverride={role === "admin"}
+            canOverride={canWrite}
             onOverride={sendOverride}
             overrideResult={lastOverride}
           />
@@ -83,9 +89,16 @@ function SOCDashboard({ username, role }: { username: string; role: string }) {
 
         {/* Right: Incident + Compliance */}
         <div className="lg:col-span-1 space-y-4">
-          <IncidentPanel />
-          <ComplianceView />
+          <IncidentPanel canWrite={canWrite} />
+          <ComplianceView canWrite={canWrite} />
         </div>
+      </div>
+
+      {/* Second row: investigation tools */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <VulnerabilityPanel canWrite={canWrite} />
+        <ReportsPanel canWrite={canWrite} />
+        <LogSearchPanel />
       </div>
     </div>
   );

@@ -9,7 +9,13 @@ import { act, renderHook } from "@testing-library/react";
 import { createWebSocket } from "../services/api";
 import { logout } from "../services/auth";
 import { useStore } from "../store/useStore";
-import { reconnectDelay, useWebSocket, WS_POLICY_VIOLATION } from "./useWebSocket";
+import {
+  agentStatusFromEvent,
+  reconnectDelay,
+  threatLevelFromFrame,
+  useWebSocket,
+  WS_POLICY_VIOLATION,
+} from "./useWebSocket";
 
 jest.mock("../services/api", () => ({ createWebSocket: jest.fn() }));
 jest.mock("../services/auth", () => ({ logout: jest.fn() }));
@@ -36,6 +42,8 @@ beforeEach(() => {
   jest.useFakeTimers();
   sockets = [];
   handlers = [];
+  // The store is a module singleton; start every test from a blank board.
+  useStore.setState({ agentStatuses: {}, threatLevel: "low", alerts: [] });
   mockCreate.mockReset();
   mockLogout.mockReset();
   mockCreate.mockImplementation((onMessage: (msg: any) => void) => {
@@ -68,6 +76,45 @@ describe("reconnectDelay", () => {
   it("always waits at least half the nominal delay", () => {
     jest.spyOn(Math, "random").mockReturnValue(0);
     expect(reconnectDelay(0)).toBe(1500);
+  });
+});
+
+describe("agentStatusFromEvent", () => {
+  it.each([
+    ["task_start", "running"],
+    ["task_complete", "idle"],
+    ["task_error", "error"],
+  ])("maps %s to %s", (event, status) => {
+    expect(agentStatusFromEvent({ agent: "compliance", event })).toEqual({
+      agent: "compliance",
+      status,
+    });
+  });
+
+  it.each([
+    [{ agent: "compliance", event: "report_ready" }],
+    [{ agent: "unknown_agent", event: "task_start" }],
+    [{ agent: "compliance" }],
+    [{ event: "task_start" }],
+    [null],
+    [undefined],
+  ])("returns null for %j", (data) => {
+    expect(agentStatusFromEvent(data)).toBeNull();
+  });
+});
+
+describe("threatLevelFromFrame", () => {
+  it("reads the level off an agent_events threat_level frame", () => {
+    expect(
+      threatLevelFromFrame({ channel: "agent_events", data: { event: "threat_level", threat_level: "medium" } })
+    ).toBe("medium");
+  });
+
+  it("rejects other channels, other events and unknown levels", () => {
+    expect(threatLevelFromFrame({ channel: "escalations", data: { event: "threat_level", threat_level: "high" } })).toBeNull();
+    expect(threatLevelFromFrame({ channel: "agent_events", data: { event: "override", threat_level: "high" } })).toBeNull();
+    expect(threatLevelFromFrame({ channel: "agent_events", data: { event: "threat_level", threat_level: "severe" } })).toBeNull();
+    expect(threatLevelFromFrame(null)).toBeNull();
   });
 });
 
@@ -200,20 +247,119 @@ describe("message routing", () => {
     expect(useStore.getState().alerts.length).toBe(before);
   });
 
-  it("records a broadcast event as an alert and updates agent status", () => {
+  it("records a broadcast event as an alert", () => {
     renderHook(() => useWebSocket());
 
+    act(() =>
+      handlers[0]({
+        channel: "agent_events",
+        data: { agent: "threat_detection", event: "task_complete" },
+      })
+    );
+
+    expect(useStore.getState().alerts[0].channel).toBe("agent_events");
+  });
+
+  it("walks an agent through running, error and idle on task events", () => {
+    renderHook(() => useWebSocket());
+    const status = () => useStore.getState().agentStatuses.threat_detection;
+
+    act(() =>
+      handlers[0]({
+        channel: "agent_events",
+        data: { agent: "threat_detection", event: "task_start", task_id: "t-1" },
+      })
+    );
+    expect(status().status).toBe("running");
+    expect(status().task_id).toBe("t-1");
+    expect(status().updatedAt).toEqual(expect.any(Number));
+
+    act(() =>
+      handlers[0]({ channel: "agent_events", data: { agent: "threat_detection", event: "task_error" } })
+    );
+    expect(status().status).toBe("error");
+
+    act(() =>
+      handlers[0]({ channel: "agent_events", data: { agent: "threat_detection", event: "task_complete" } })
+    );
+    expect(status().status).toBe("idle");
+    expect(status().task_id).toBeUndefined();
+  });
+
+  it("does not treat informational events as status changes", () => {
+    renderHook(() => useWebSocket());
+
+    // Each of these used to flip its sender to "running" with nothing to flip it back.
+    for (const data of [
+      { agent: "supervisor", event: "routing_decision" },
+      { agent: "supervisor", event: "escalation_received" },
+      { agent: "supervisor", event: "escalation_handled" },
+      { agent: "reporting", event: "report_ready" },
+      { agent: "human", event: "override" },
+      { agent: "simulation", event: "logs_ready" },
+    ]) {
+      act(() => handlers[0]({ channel: "agent_events", data }));
+    }
+
+    expect(useStore.getState().agentStatuses).toEqual({});
+  });
+
+  it("ignores status events from publishers that are not agents", () => {
+    renderHook(() => useWebSocket());
+
+    act(() => handlers[0]({ channel: "agent_events", data: { agent: "human", event: "task_start" } }));
+    act(() =>
+      handlers[0]({ channel: "agent_events", data: { agent: "simulation", event: "task_complete" } })
+    );
+
+    expect(useStore.getState().agentStatuses).toEqual({});
+  });
+
+  it("only status-maps frames on the agent_events channel", () => {
+    renderHook(() => useWebSocket());
+
+    act(() =>
+      handlers[0]({ channel: "escalations", data: { agent: "log_analysis", event: "task_start" } })
+    );
+
+    expect(useStore.getState().agentStatuses).toEqual({});
+  });
+
+  it("takes the threat level only from threat_level frames", () => {
+    renderHook(() => useWebSocket());
+
+    // A threat_level riding on some other event is not the board's effective level.
     act(() =>
       handlers[0]({
         channel: "agent_events",
         data: { agent: "threat_detection", event: "task_complete", threat_level: "critical" },
       })
     );
+    act(() =>
+      handlers[0]({ channel: "escalations", data: { event: "threat_level", threat_level: "critical" } })
+    );
+    expect(useStore.getState().threatLevel).toBe("low");
 
-    const state = useStore.getState();
-    expect(state.alerts[0].channel).toBe("agent_events");
-    expect(state.agentStatuses.threat_detection.status).toBe("idle");
-    expect(state.threatLevel).toBe("critical");
+    act(() =>
+      handlers[0]({
+        channel: "agent_events",
+        data: { agent: "supervisor", event: "threat_level", threat_level: "HIGH" },
+      })
+    );
+    expect(useStore.getState().threatLevel).toBe("high");
+  });
+
+  it("ignores a threat_level frame carrying an unknown level", () => {
+    renderHook(() => useWebSocket());
+
+    act(() =>
+      handlers[0]({
+        channel: "agent_events",
+        data: { agent: "supervisor", event: "threat_level", threat_level: "bananas" },
+      })
+    );
+
+    expect(useStore.getState().threatLevel).toBe("low");
   });
 
   it("refuses to send an override over a socket that is not open", () => {

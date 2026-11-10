@@ -42,9 +42,26 @@ async def test_protected_route_rejects_garbage_token(api_client):
     assert resp.status_code == 401
 
 
-async def test_login_returns_token(api_client):
+ADMIN_PW = "Adm1n-integration-pass"
+ANALYST_PW = "Analyst-integration-pass"
+
+
+@pytest.fixture
+def credentials(monkeypatch):
+    """Non-default passwords, as a real deployment must configure."""
+    from api.middleware.auth import reset_user_cache
+    from core.config import settings
+    monkeypatch.setattr(settings, "admin_password", ADMIN_PW)
+    monkeypatch.setattr(settings, "analyst_password", ANALYST_PW)
+    monkeypatch.setattr(settings, "allow_insecure_defaults", False)
+    reset_user_cache()
+    yield
+    reset_user_cache()
+
+
+async def test_login_returns_token(api_client, credentials):
     resp = await api_client.post(
-        "/api/v1/auth/login", json={"username": "admin", "password": "admin123"}
+        "/api/v1/auth/login", json={"username": "admin", "password": ADMIN_PW}
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -53,16 +70,64 @@ async def test_login_returns_token(api_client):
     assert body["access_token"]
 
 
-async def test_login_rejects_bad_password(api_client):
+async def test_login_rejects_bad_password(api_client, credentials):
     resp = await api_client.post(
         "/api/v1/auth/login", json={"username": "admin", "password": "wrong"}
     )
     assert resp.status_code == 401
 
 
-async def test_login_token_opens_protected_route(api_client):
+@pytest.mark.parametrize("password", ["", "admin123", "change_me_admin_password", "short"])
+async def test_default_or_weak_password_disables_the_account(api_client, monkeypatch, password):
+    """The README's demo password must not open a deployment that never changed it."""
+    from api.middleware.auth import reset_user_cache
+    from core.config import settings
+    monkeypatch.setattr(settings, "admin_password", password)
+    monkeypatch.setattr(settings, "allow_insecure_defaults", False)
+    reset_user_cache()
+    try:
+        resp = await api_client.post(
+            "/api/v1/auth/login", json={"username": "admin", "password": password or "admin123"}
+        )
+    finally:
+        reset_user_cache()
+    assert resp.status_code == 401
+
+
+async def test_insecure_defaults_flag_restores_demo_login(api_client, monkeypatch):
+    from api.middleware.auth import reset_user_cache
+    from core.config import settings
+    monkeypatch.setattr(settings, "admin_password", "")
+    monkeypatch.setattr(settings, "allow_insecure_defaults", True)
+    reset_user_cache()
+    try:
+        resp = await api_client.post(
+            "/api/v1/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+    finally:
+        reset_user_cache()
+    assert resp.status_code == 200
+
+
+async def test_repeated_failures_lock_the_login(api_client, credentials, monkeypatch):
+    from core.config import settings
+    monkeypatch.setattr(settings, "login_max_failures", 3)
+    for _ in range(3):
+        bad = await api_client.post(
+            "/api/v1/auth/login", json={"username": "admin", "password": "nope"}
+        )
+        assert bad.status_code == 401
+    # Even the right password is refused while locked out.
+    locked = await api_client.post(
+        "/api/v1/auth/login", json={"username": "admin", "password": ADMIN_PW}
+    )
+    assert locked.status_code == 429
+    assert "Retry-After" in locked.headers
+
+
+async def test_login_token_opens_protected_route(api_client, credentials):
     login = await api_client.post(
-        "/api/v1/auth/login", json={"username": "analyst", "password": "analyst123"}
+        "/api/v1/auth/login", json={"username": "analyst", "password": ANALYST_PW}
     )
     token = login.json()["access_token"]
     resp = await api_client.get(

@@ -42,9 +42,16 @@ async def generate_report(request: Request, body: ReportRequest):
 async def list_reports(limit: int = Query(default=20, ge=1, le=100)):
     try:
         index = await redis_client.cache.lrange("reports:index", 0, limit - 1)
+        # Reports expire after 7 days but their index entries did not, so the list
+        # offered reports that then 404'd. Only list keys that still exist.
+        live = [
+            entry for entry in index
+            if isinstance(entry, dict) and entry.get("key")
+            and await redis_client.cache.exists(entry["key"])
+        ]
     except Exception:
-        index = []
-    return {"reports": index, "count": len(index)}
+        live = []
+    return {"reports": live, "count": len(live)}
 
 
 @router.get("/{report_key:path}")

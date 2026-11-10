@@ -81,16 +81,18 @@ class ThreatDetectionAgent(BaseSecurityAgent):
         graph.add_node("decide_escalation", self._decide_escalation)
         graph.add_node("persist_event", self._persist_event)
 
+        # Persist before deciding on escalation so the escalation can carry the stored
+        # event id, which links the threat event to the incident it produces.
         graph.set_entry_point("assess_threat")
         graph.add_edge("assess_threat", "enrich_iocs")
         graph.add_edge("enrich_iocs", "map_mitre")
-        graph.add_edge("map_mitre", "decide_escalation")
-        graph.add_edge("decide_escalation", "persist_event")
-        graph.add_edge("persist_event", END)
+        graph.add_edge("map_mitre", "persist_event")
+        graph.add_edge("persist_event", "decide_escalation")
+        graph.add_edge("decide_escalation", END)
         return graph.compile()
 
     async def _assess_threat(self, state: ThreatState) -> dict:
-        event_str = json.dumps(state["raw_event"], indent=2)
+        event_str = json.dumps(state["raw_event"], indent=2, default=str)
         context = await rag_chain.threat_rag.ainvoke(
             f"threat classification for: {state['raw_event'].get('threat_type', event_str[:200])}"
         )
@@ -103,10 +105,16 @@ class ThreatDetectionAgent(BaseSecurityAgent):
                           "indicators": [], "mitre_tactics": [], "mitre_techniques": [],
                           "reasoning": str(response.content), "should_escalate": False}
 
+        # Models return "High" / "CRITICAL" as often as "high"; the escalation rule and
+        # the persisted record both expect the lowercase band.
+        severity = str(assessment.get("severity") or "medium").strip().lower()
+        if severity not in ("critical", "high", "medium", "low", "info"):
+            severity = "medium"
+        assessment["severity"] = severity
         return {
             "messages": [AIMessage(content=f"Assessment complete: {assessment.get('threat_type')}")],
             "threat_assessment": assessment,
-            "severity": assessment.get("severity", "medium"),
+            "severity": severity,
         }
 
     async def _enrich_iocs(self, state: ThreatState) -> dict:
@@ -159,7 +167,8 @@ class ThreatDetectionAgent(BaseSecurityAgent):
         )
 
         metrics.threat_events_total.labels(
-            severity=str(severity), threat_type=str(threat_type)
+            severity=metrics.severity_label(severity),
+            threat_type=metrics.threat_type_label(threat_type),
         ).inc()
 
         if should_escalate:
@@ -167,6 +176,7 @@ class ThreatDetectionAgent(BaseSecurityAgent):
                 "severity": severity,
                 "threat_type": threat_type,
                 "event": state["raw_event"],
+                "event_id": state.get("event_id"),
                 "assessment": assessment,
             })
 

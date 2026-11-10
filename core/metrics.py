@@ -71,6 +71,38 @@ incidents_total = Counter(
     ["playbook"],
 )
 
+simulation_logs_dropped_total = Counter(
+    "simulation_logs_dropped_total",
+    "Queued simulation logs discarded because they were older than SIMULATION_MAX_LAG_SECONDS",
+)
+
+# ── Label hygiene ─────────────────────────────────────────────────────────────
+# Several labels used to take free text straight from LLM output, so every novel
+# phrasing ("Brute-Force (SSH)") minted a new time series. Clamp them to known sets.
+
+KNOWN_SEVERITIES = ("critical", "high", "medium", "low", "info")
+KNOWN_THREAT_TYPES = (
+    "port_scan", "brute_force", "sql_injection", "xss", "path_traversal",
+    "command_injection", "c2_beacon", "data_exfiltration", "ransomware", "malware",
+    "phishing", "privilege_escalation", "lateral_movement", "dos", "none", "unknown",
+)
+
+
+def severity_label(value) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in KNOWN_SEVERITIES else "unknown"
+
+
+def threat_type_label(value) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in KNOWN_THREAT_TYPES:
+        return text
+    for known in KNOWN_THREAT_TYPES:
+        if known not in ("none", "unknown") and known in text:
+            return known
+    return "other"
+
+
 _THREAT_LEVELS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 soc_threat_level = Gauge(
@@ -87,16 +119,41 @@ def set_threat_level(level: str) -> None:
 
 # ── ASGI middleware ───────────────────────────────────────────────────────────
 
+UNMATCHED_HANDLER = "<unmatched>"
+
+
+def _route_template(route) -> str | None:
+    return getattr(route, "path_format", None) or getattr(route, "path", None)
+
+
 def _handler_label(scope: Scope) -> str:
     """
-    Prefer the matched route template (``/api/v1/agents/{agent_name}/history``) over
-    the raw path so that per-incident URLs do not explode metric cardinality.
+    The matched route template (``/api/v1/incidents/{incident_id}``), never the raw path.
+
+    ``scope["route"]`` is only set when routing ran. A request the auth middleware
+    rejected never reaches the router, and a 404 matches nothing — both used to fall
+    back to the raw path, so anonymous junk requests minted one series per URL.
+    Resolve the template against the app's routes instead, and give anything that
+    matches no route a single shared label.
     """
-    route = scope.get("route")
-    path_format = getattr(route, "path_format", None) or getattr(route, "path", None)
-    if path_format:
-        return path_format
-    return scope.get("path", "unknown")
+    template = _route_template(scope.get("route"))
+    if template:
+        return template
+
+    app = scope.get("app")
+    router = getattr(app, "router", None)
+    if router is not None:
+        from starlette.routing import Match
+        for route in getattr(router, "routes", []):
+            try:
+                match, _ = route.matches(scope)
+            except Exception:
+                continue
+            if match == Match.FULL:
+                template = _route_template(route)
+                if template:
+                    return template
+    return UNMATCHED_HANDLER
 
 
 class PrometheusMiddleware:

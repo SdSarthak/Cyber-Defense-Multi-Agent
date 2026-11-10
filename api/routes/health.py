@@ -45,8 +45,12 @@ async def _check_chroma() -> bool:
 
 @router.get("/health")
 async def health():
-    """Liveness probe — always 200 so the container is not killed when a backing service blips."""
-    return {"status": "ok", "redis": await _check_redis()}
+    """Liveness probe — always 200, and quick, so a hung backing service cannot fail it."""
+    try:
+        redis_ok = await asyncio.wait_for(_check_redis(), timeout=1.0)
+    except asyncio.TimeoutError:
+        redis_ok = False
+    return {"status": "ok", "redis": redis_ok}
 
 
 @router.get("/health/ready")

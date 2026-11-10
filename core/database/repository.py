@@ -16,7 +16,7 @@ from enum import Enum as PyEnum
 from typing import Any
 
 import structlog
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
 from core.config import settings
 from core.database.base import AsyncSessionLocal
@@ -122,6 +122,15 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _is_ip(value: Any) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(str(value))
+        return True
+    except ValueError:
+        return False
+
+
 def enabled() -> bool:
     return bool(settings.enable_persistence)
 
@@ -219,17 +228,50 @@ async def threat_severity_counts(hours: int = 24) -> dict[str, int]:
 
 # ── Incidents ────────────────────────────────────────────────────────────────
 
+async def _link_threat_events(
+    session, incident_uuid: uuid.UUID, event_ids: list, affected_assets: list | None,
+    window_hours: int = 24,
+) -> None:
+    """
+    Attach the threat events behind an incident to it.
+
+    Explicit ids (the detection that escalated) are linked directly; unlinked events
+    from the same source IPs in the last day are pulled in too, so one attacker's
+    activity rolls up under one incident instead of floating free.
+    """
+    ids = [u for u in (_as_uuid(e) for e in event_ids) if u]
+    if ids:
+        await session.execute(
+            update(ThreatEvent).where(ThreatEvent.id.in_(ids)).values(incident_id=incident_uuid)
+        )
+    ips = [str(a) for a in (affected_assets or []) if isinstance(a, str) and a]
+    if ips:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+        await session.execute(
+            update(ThreatEvent)
+            .where(
+                ThreatEvent.incident_id.is_(None),
+                ThreatEvent.source_ip.in_(ips),
+                ThreatEvent.created_at >= cutoff,
+            )
+            .values(incident_id=incident_uuid)
+        )
+
+
 async def save_incident(
     incident: dict,
     response_plan: dict,
     actions_taken: list[dict] | None = None,
+    threat_event_ids: list | None = None,
 ) -> str | None:
     """Create (or update, when the id already exists) an incident record."""
     if not enabled():
         return None
     try:
         async with AsyncSessionLocal() as session:
-            incident_uuid = _as_uuid(response_plan.get("incident_id")) or _as_uuid(incident.get("id"))
+            # The caller's id is authoritative. The LLM's plan used to win, so a
+            # model-invented id could overwrite an unrelated incident row.
+            incident_uuid = _as_uuid(incident.get("id")) or _as_uuid(response_plan.get("incident_id"))
             row = None
             if incident_uuid:
                 row = await session.get(Incident, incident_uuid)
@@ -249,17 +291,25 @@ async def save_incident(
                 row = Incident(id=incident_uuid or uuid.uuid4())
                 session.add(row)
 
+            is_new = row.status is None
             row.title = title
             row.description = incident.get("description") or ""
             row.severity = severity
-            row.status = coerce_incident_status(incident.get("status"), IncidentStatus.INVESTIGATING)
+            if is_new:
+                row.status = coerce_incident_status(incident.get("status"), IncidentStatus.INVESTIGATING)
+            elif incident.get("status"):
+                row.status = coerce_incident_status(incident.get("status"), row.status)
             row.assigned_agent = "incident_response"
             row.playbook_used = _clip(response_plan.get("playbook") or incident.get("type"), 100)
-            row.timeline = response_plan.get("timeline") or []
+            # Re-running a playbook must not erase the analyst notes already on the
+            # timeline; append the new plan's entries instead of replacing them.
+            row.timeline = list(row.timeline or []) + list(response_plan.get("timeline") or [])
             row.remediation_steps = response_plan.get("containment_actions") or []
             row.affected_assets = (
                 incident.get("affected_assets") or response_plan.get("affected_assets") or []
             )
+            await session.flush()
+            await _link_threat_events(session, row.id, threat_event_ids or [], row.affected_assets)
             await session.commit()
             return str(row.id)
     except Exception as exc:
@@ -292,6 +342,43 @@ async def update_incident(incident_id: str, status: str, note: str | None = None
             return _incident_to_dict(row)
     except Exception as exc:
         log.warning("persistence.update_incident_failed", error=str(exc))
+        return None
+
+
+async def update_containment_action(
+    incident_id: str, index: int, status: str, result: dict | None = None,
+) -> dict | None:
+    """Set the status (and execution result) of one containment action on an incident."""
+    if not enabled():
+        return None
+    incident_uuid = _as_uuid(incident_id)
+    if incident_uuid is None:
+        return None
+    try:
+        async with AsyncSessionLocal() as session:
+            row = await session.get(Incident, incident_uuid)
+            if row is None:
+                return None
+            steps = [
+                dict(a) if isinstance(a, dict) else {"action": str(a)}
+                for a in (row.remediation_steps or [])
+            ]
+            if not 0 <= index < len(steps):
+                return None
+            steps[index]["status"] = status
+            if result is not None:
+                steps[index]["result"] = result
+            row.remediation_steps = steps
+            timeline = list(row.timeline or [])
+            timeline.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "event": f"containment action {index} {status}: {steps[index].get('action', '')}",
+            })
+            row.timeline = timeline
+            await session.commit()
+            return steps[index]
+    except Exception as exc:
+        log.warning("persistence.update_containment_action_failed", error=str(exc))
         return None
 
 
@@ -342,6 +429,55 @@ def _incident_to_dict(row: Incident) -> dict:
     }
 
 
+async def incident_metrics(hours: int = 24 * 30) -> dict:
+    """
+    Incident figures for reports, computed from the record rather than estimated by
+    the LLM. Mean time to detect is the gap between the first linked threat event and
+    the incident; mean time to respond is the gap between the incident and resolution.
+    """
+    empty = {
+        "total_incidents": 0, "critical_incidents": 0, "open_incidents": 0,
+        "mean_time_to_detect_hours": None, "mean_time_to_respond_hours": None,
+    }
+    if not enabled():
+        return empty
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(int(hours), 1))
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(
+                select(Incident).where(Incident.created_at >= cutoff)
+            )).scalars().all()
+            first_seen = dict((await session.execute(
+                select(ThreatEvent.incident_id, func.min(ThreatEvent.created_at))
+                .where(ThreatEvent.incident_id.is_not(None))
+                .group_by(ThreatEvent.incident_id)
+            )).all())
+    except Exception as exc:
+        log.warning("persistence.incident_metrics_failed", error=str(exc))
+        return empty
+
+    detect, respond = [], []
+    for r in rows:
+        seen = first_seen.get(r.id)
+        if seen and r.created_at and r.created_at >= seen:
+            detect.append((r.created_at - seen).total_seconds() / 3600)
+        if r.resolved_at and r.created_at:
+            respond.append((r.resolved_at - r.created_at).total_seconds() / 3600)
+
+    def _mean(values):
+        return round(sum(values) / len(values), 2) if values else None
+
+    return {
+        "total_incidents": len(rows),
+        "critical_incidents": sum(1 for r in rows if r.severity == SeverityLevel.CRITICAL),
+        "open_incidents": sum(
+            1 for r in rows if r.status in (IncidentStatus.OPEN, IncidentStatus.INVESTIGATING)
+        ),
+        "mean_time_to_detect_hours": _mean(detect),
+        "mean_time_to_respond_hours": _mean(respond),
+    }
+
+
 # ── Vulnerabilities ──────────────────────────────────────────────────────────
 
 async def save_vulnerability(cve_data: dict, risk_report: dict) -> str | None:
@@ -366,9 +502,12 @@ async def save_vulnerability(cve_data: dict, risk_report: dict) -> str | None:
             row.cvss_vector = _clip(cve_data.get("vector"), 100)
             row.severity = coerce_severity(cve_data.get("severity"), severity_from_cvss(cvss))
             row.affected_products = affected
-            row.patch_available = bool(risk_report.get("remediation"))
+            # Only claim a patch exists when the risk report says so explicitly; any
+            # remediation prose used to flip this to True for every CVE.
+            row.patch_available = bool(risk_report.get("patch_available", False))
             row.exploit_available = str(risk_report.get("exploitability", "")).lower() == "high"
-            row.asset_ip = _clip(affected[0], 45) if affected else None
+            # affected_assets is LLM output and may hold hostnames; only an IP fits here.
+            row.asset_ip = next((_clip(a, 45) for a in affected if _is_ip(a)), None)
             row.remediation_status = (
                 "urgent" if str(risk_report.get("patch_urgency")) == "immediate" else "open"
             )
@@ -417,20 +556,35 @@ async def list_vulnerabilities(limit: int = 50) -> list[dict]:
 
 # ── Compliance ───────────────────────────────────────────────────────────────
 
-async def save_compliance_results(framework: str, control_results: list[dict]) -> int:
-    """Persist one row per evaluated control. Returns the number of rows written."""
+async def save_compliance_results(
+    framework: str, control_results: list[dict], evaluation_id: str | None = None,
+) -> int:
+    """
+    Persist one row per evaluated control. Returns the number of rows written.
+
+    The evidence column used to receive the *remediation* text, and score / risk were
+    dropped, so history could not show what a control was judged on or how it scored.
+    """
     if not enabled() or not control_results:
         return 0
+    import json
+    eval_uuid = _as_uuid(evaluation_id) or uuid.uuid4()
     try:
         async with AsyncSessionLocal() as session:
             for result in control_results:
+                evidence = result.get("evidence")
                 session.add(ComplianceCheck(
                     framework=_clip(framework, 50) or "unknown",
                     control_id=_clip(result.get("control_id") or "unknown", 50),
                     control_name=_clip(result.get("control_name") or "", 255) or "",
-                    status=_clip(result.get("status") or "partial", 50),
-                    evidence=result.get("remediation") or "",
+                    status=_clip(str(result.get("status") or "partial").lower(), 50),
+                    evidence=json.dumps(evidence, default=str) if evidence is not None else None,
                     findings=result.get("findings") or [],
+                    score=_to_float(result.get("score")),
+                    risk_if_failed=_clip(str(result.get("risk_if_failed") or "").lower() or None, 20),
+                    evidence_quality=_clip(str(result.get("evidence_quality") or "").lower() or None, 20),
+                    remediation=result.get("remediation") or None,
+                    evaluation_id=eval_uuid,
                 ))
             await session.commit()
             return len(control_results)
@@ -457,6 +611,11 @@ async def compliance_history(framework: str | None = None, limit: int = 100) -> 
                     "status": r.status,
                     "evidence": r.evidence,
                     "findings": r.findings,
+                    "score": r.score,
+                    "risk_if_failed": r.risk_if_failed,
+                    "evidence_quality": r.evidence_quality,
+                    "remediation": r.remediation,
+                    "evaluation_id": str(r.evaluation_id) if r.evaluation_id else None,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows
@@ -476,11 +635,15 @@ async def save_agent_action(
     output_data: dict | None = None,
     success: bool = True,
     duration_ms: int | None = None,
+    incident_id: Any = None,
 ) -> str | None:
     if not enabled():
         return None
     try:
         async with AsyncSessionLocal() as session:
+            incident_uuid = _as_uuid(incident_id)
+            if incident_uuid is not None and await session.get(Incident, incident_uuid) is None:
+                incident_uuid = None  # a Redis-only id must not violate the foreign key
             row = AgentAction(
                 agent_name=_clip(agent_name, 100) or "unknown",
                 action_type=_clip(action_type, 100) or "run",
@@ -489,6 +652,7 @@ async def save_agent_action(
                 output_data=_jsonable(output_data),
                 success=success,
                 duration_ms=duration_ms,
+                incident_id=incident_uuid,
             )
             session.add(row)
             await session.commit()
@@ -629,3 +793,53 @@ async def count_open_incidents() -> int:
     except Exception as exc:
         log.warning("persistence.count_open_incidents_failed", error=str(exc))
         return 0
+
+
+async def compliance_summary() -> dict:
+    """Latest evaluation per framework: control count, pass/fail and mean score."""
+    if not enabled():
+        return {}
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(
+                select(ComplianceCheck).order_by(desc(ComplianceCheck.created_at)).limit(500)
+            )).scalars().all()
+    except Exception as exc:
+        log.warning("persistence.compliance_summary_failed", error=str(exc))
+        return {}
+
+    latest: dict[str, Any] = {}
+    for r in rows:  # newest first: the first evaluation seen per framework is the latest
+        latest.setdefault(r.framework, r.evaluation_id)
+    summary: dict[str, dict] = {}
+    for framework, evaluation in latest.items():
+        checks = [r for r in rows if r.framework == framework and r.evaluation_id == evaluation]
+        scores = [r.score for r in checks if r.score is not None]
+        summary[framework] = {
+            "controls": len(checks),
+            "passed": sum(1 for r in checks if r.status == "pass"),
+            "failed": sum(1 for r in checks if r.status == "fail"),
+            "score": round(sum(scores) / len(scores), 1) if scores else None,
+        }
+    return summary
+
+
+async def log_stats(hours: int = 24) -> dict:
+    """Volume of analysed logs and how many were flagged, for compliance evidence."""
+    if not enabled():
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(int(hours), 1))
+    try:
+        async with AsyncSessionLocal() as session:
+            total = (await session.execute(
+                select(func.count()).select_from(LogEntry).where(LogEntry.created_at >= cutoff)
+            )).scalar() or 0
+            flagged = (await session.execute(
+                select(func.count()).select_from(LogEntry).where(
+                    LogEntry.created_at >= cutoff, LogEntry.is_anomalous.is_(True)
+                )
+            )).scalar() or 0
+    except Exception as exc:
+        log.warning("persistence.log_stats_failed", error=str(exc))
+        return {}
+    return {"window_hours": hours, "logs_analysed": int(total), "logs_flagged": int(flagged)}

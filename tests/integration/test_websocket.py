@@ -99,13 +99,47 @@ def test_admin_can_pause_and_resume(client, fake_cache):
     assert resumed["result"] == {"ok": True, "agent": "threat_detection", "status": "resumed"}
 
 
-def test_analyst_may_set_threat_level(client, fake_cache):
-    """set_threat_level is deliberately not admin-only — analysts run the board."""
-    assert "set_threat_level" not in ADMIN_ONLY_COMMANDS
+def test_analyst_may_not_set_threat_level(client, fake_cache):
+    """The analyst role is read-only on the socket exactly as on the REST API."""
+    assert "set_threat_level" in ADMIN_ONLY_COMMANDS
     with client.websocket_connect(f"/ws?token={_analyst_token()}") as ws:
         ws.receive_json()
         reply = _override(ws, "set_threat_level", {"threat_level": "high"})
+    assert reply["result"]["ok"] is False
+    assert "blackboard:threat_level" not in fake_cache.store
+
+
+def test_admin_sets_threat_level(client, fake_cache):
+    with client.websocket_connect(f"/ws?token={_admin_token()}") as ws:
+        ws.receive_json()
+        reply = _override(ws, "set_threat_level", {"threat_level": "HIGH"})
     assert reply["result"] == {"ok": True, "threat_level": "high"}
+    assert fake_cache.store["blackboard:threat_level"] == "high"
+    assert fake_cache.store["blackboard:threat_level_meta"]["source"] == "human:admin"
+
+
+def test_unknown_threat_level_is_refused(client, fake_cache):
+    with client.websocket_connect(f"/ws?token={_admin_token()}") as ws:
+        ws.receive_json()
+        reply = _override(ws, "set_threat_level", {"threat_level": "banana"})
+    assert reply["result"]["ok"] is False
+    assert "blackboard:threat_level" not in fake_cache.store
+
+
+def test_socket_is_closed_when_the_token_expires(client, monkeypatch):
+    """Authenticated only at the handshake, the socket used to outlive its token."""
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt
+    token = jwt.encode(
+        {"sub": "admin", "role": "admin",
+         "exp": datetime.now(timezone.utc) + timedelta(seconds=1)},
+        settings.api_secret_key, algorithm=settings.api_algorithm,
+    )
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            ws.receive_json()          # hello
+            ws.receive_json()          # blocks until the server closes at expiry
+    assert exc.value.code == WS_POLICY_VIOLATION
 
 
 # ── Command handling ──────────────────────────────────────────────────────────

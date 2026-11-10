@@ -45,6 +45,10 @@ async def _status_for(name: str) -> dict:
         )
     except Exception:
         status["paused"] = False
+    # The pause key is the source of truth. A "disabled" status left behind after the
+    # key is gone (resumed elsewhere, or an old expiring pause) is not a paused agent.
+    if not status["paused"] and status.get("status") == "disabled":
+        status["status"] = "idle"
     return status
 
 

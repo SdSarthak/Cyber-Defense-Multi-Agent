@@ -1,0 +1,13 @@
+# Keep build contexts small and secrets out of images.
+.git
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.coverage
+htmlcov
+dashboard/node_modules
+dashboard/build
+dashboard/.env.local

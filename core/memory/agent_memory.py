@@ -1,7 +1,8 @@
 """
-Two-tier memory for each agent:
-  - Short-term: Redis (TTL-backed, task-scoped)
-  - Long-term:  PostgreSQL via AgentAction audit log + Redis lists for recency
+Agent memory backed by Redis:
+  - a capped per-agent event history (the durable audit trail is the PostgreSQL
+    AgentAction table, written by BaseSecurityAgent);
+  - the shared blackboard all agents read and write.
 
 The module accesses ``redis_client.cache`` through the module object rather than
 importing the singleton by value, so a single patch point swaps the backing store
@@ -24,34 +25,6 @@ class AgentMemory:
     def __init__(self, agent_name: str):
         self.agent_name = agent_name
         self._prefix = f"agent:{agent_name}"
-
-    # ── Short-term (Redis) ────────────────────────────────────────────────────
-
-    async def remember(self, key: str, value, ttl: int = 1800) -> None:
-        await redis_client.cache.set(f"{self._prefix}:st:{key}", value, ttl=ttl)
-
-    async def recall(self, key: str):
-        return await redis_client.cache.get(f"{self._prefix}:st:{key}")
-
-    async def forget(self, key: str) -> None:
-        await redis_client.cache.delete(f"{self._prefix}:st:{key}")
-
-    async def set_task_context(self, task_id: str, context: dict) -> None:
-        await redis_client.cache.set(f"{self._prefix}:task:{task_id}", context, ttl=7200)
-
-    async def get_task_context(self, task_id: str) -> dict | None:
-        return await redis_client.cache.get(f"{self._prefix}:task:{task_id}")
-
-    # ── Working memory (in-process dict, cleared per task) ───────────────────
-
-    def new_working_memory(self) -> dict:
-        return {
-            "agent": self.agent_name,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "observations": [],
-            "decisions": [],
-            "tool_calls": [],
-        }
 
     # ── Long-term event log (Redis list, capped) ──────────────────────────────
 

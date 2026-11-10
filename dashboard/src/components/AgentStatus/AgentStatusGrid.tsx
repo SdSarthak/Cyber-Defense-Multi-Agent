@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../../services/api";
-import { useStore } from "../../store/useStore";
+import { api, AgentStatusEntry } from "../../services/api";
+import { AgentStatus, useStore } from "../../store/useStore";
 import type { OverrideResult } from "../../hooks/useWebSocket";
 
 const AGENT_ICONS: Record<string, string> = {
@@ -19,10 +19,27 @@ const STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-500 animate-pulse",
   error: "bg-red-500",
   disabled: "bg-gray-500",
+  paused: "bg-gray-500",
 };
 
-// The server records a paused agent as "disabled"; operators call it paused.
-const STATUS_LABELS: Record<string, string> = { disabled: "paused" };
+/**
+ * What the grid shows for one agent.
+ *
+ * `paused` comes only from the REST snapshot: it reflects the pause key itself, so a
+ * pause that was lifted (or never applied) cannot leave a stale "paused" label behind
+ * the way reading `status === "disabled"` did. The run status takes whichever source
+ * is newer — a socket `task_*` event that landed after the last poll wins.
+ */
+export function resolveAgentView(
+  polled: AgentStatusEntry | undefined,
+  live: AgentStatus | undefined,
+  polledAt: number,
+): { status: string; paused: boolean } {
+  const paused = Boolean(polled?.paused);
+  const liveIsNewer = Boolean(live?.updatedAt && live.updatedAt > polledAt);
+  const status = (liveIsNewer ? live?.status : polled?.status) || live?.status || "idle";
+  return { status, paused };
+}
 
 interface Props {
   /** Overrides that mutate agent state are admin-only, mirroring the server check. */
@@ -34,17 +51,15 @@ interface Props {
 }
 
 export function AgentStatusGrid({ canOverride = false, onOverride, overrideResult }: Props) {
-  const { agentStatuses } = useStore();
+  const agentStatuses = useStore((s) => s.agentStatuses);
   const queryClient = useQueryClient();
   const [note, setNote] = useState<string | null>(null);
 
-  const { data } = useQuery({
+  const { data, dataUpdatedAt } = useQuery({
     queryKey: ["agent-statuses"],
     queryFn: api.getAgentStatuses,
     refetchInterval: 5000,
   });
-
-  const statuses = data || agentStatuses;
 
   function toggle(name: string, paused: boolean) {
     if (!onOverride) return;
@@ -64,9 +79,12 @@ export function AgentStatusGrid({ canOverride = false, onOverride, overrideResul
       <h2 className="text-white font-semibold mb-3 text-sm uppercase tracking-wide">Agent Mesh</h2>
       <div className="grid grid-cols-2 gap-2">
         {Object.entries(AGENT_ICONS).map(([name, icon]) => {
-          const s = statuses[name] || {};
-          const status = (s as any).status || "idle";
-          const paused = status === "disabled";
+          const { status, paused } = resolveAgentView(
+            data?.[name],
+            agentStatuses[name],
+            dataUpdatedAt,
+          );
+          const label = paused ? "paused" : status;
           return (
             <div key={name} className="flex items-center gap-2 bg-gray-800 rounded p-2">
               <span className="text-lg">{icon}</span>
@@ -74,9 +92,7 @@ export function AgentStatusGrid({ canOverride = false, onOverride, overrideResul
                 <p className="text-white text-xs font-medium truncate">
                   {name.replace(/_/g, " ")}
                 </p>
-                <p className="text-gray-400 text-xs capitalize">
-                  {STATUS_LABELS[status] || status}
-                </p>
+                <p className="text-gray-400 text-xs capitalize">{label}</p>
               </div>
               {/* The supervisor owns dispatch; pausing it would strand every task. */}
               {canOverride && name !== "supervisor" && (
@@ -88,7 +104,7 @@ export function AgentStatusGrid({ canOverride = false, onOverride, overrideResul
                   {paused ? "Resume" : "Pause"}
                 </button>
               )}
-              <div className={`w-2 h-2 rounded-full ${STATUS_COLORS[status] || "bg-gray-500"}`} />
+              <div className={`w-2 h-2 rounded-full ${STATUS_COLORS[label] || "bg-gray-500"}`} />
             </div>
           );
         })}

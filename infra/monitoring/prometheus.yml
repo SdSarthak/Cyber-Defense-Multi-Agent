@@ -8,10 +8,7 @@ scrape_configs:
       - targets: ["api:8000"]
     metrics_path: /metrics
 
-  - job_name: "redis"
-    static_configs:
-      - targets: ["redis:6379"]
-
-  - job_name: "postgres"
-    static_configs:
-      - targets: ["postgres:5432"]
+# Redis and PostgreSQL do not speak the Prometheus exposition format, so scraping
+# redis:6379 / postgres:5432 directly only produced permanently-down targets. To
+# monitor them, run oliver006/redis_exporter and prometheuscommunity/postgres-exporter
+# and add their :9121 / :9187 endpoints here.

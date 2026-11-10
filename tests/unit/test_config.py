@@ -6,11 +6,44 @@ from unittest.mock import patch
 
 def test_default_settings():
     from core.config import Settings
-    s = Settings()
+    s = Settings(_env_file=None)
     assert s.gemini_model == "gemini-2.5-flash"
+    assert s.gemini_embedding_model == "models/gemini-embedding-001"
     assert s.postgres_port == 5432
     assert s.redis_port == 6379
-    assert s.agent_max_iterations == 10
+    assert s.containment_require_approval is True
+    assert s.simulation_inject_escalations is False
+
+
+@pytest.mark.parametrize("key", ["", "supersecretkey_change_in_production", "short-key"])
+def test_known_or_short_signing_key_is_replaced(key):
+    """A repo-default key lets anyone mint an admin token; it must never sign one."""
+    from core.config import Settings, harden
+    s = harden(Settings(_env_file=None, api_secret_key=key, allow_insecure_defaults=False))
+    assert s.api_secret_key != key
+    assert len(s.api_secret_key) >= 32
+
+
+def test_strong_signing_key_is_kept():
+    from core.config import Settings, harden
+    key = "k" * 48
+    s = harden(Settings(_env_file=None, api_secret_key=key))
+    assert s.api_secret_key == key
+
+
+def test_insecure_defaults_flag_keeps_the_demo_key():
+    from core.config import Settings, harden
+    s = harden(Settings(_env_file=None, api_secret_key="", allow_insecure_defaults=True))
+    assert s.api_secret_key == "supersecretkey_change_in_production"
+
+
+@pytest.mark.parametrize("password,weak", [
+    ("", True), ("admin123", True), ("change_me_admin_password", True), ("short", True),
+    ("a-real-passphrase", False),
+])
+def test_password_strength_check(password, weak):
+    from core.config import Settings
+    assert Settings(_env_file=None).insecure_password(password) is weak
 
 
 def test_postgres_url_format():

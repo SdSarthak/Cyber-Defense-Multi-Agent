@@ -67,19 +67,53 @@ async def test_playbook_falls_back_to_incident_type(ir_agent):
     assert result["playbook_name"] == "ransomware"
 
 
-async def test_automated_actions_executed(ir_agent):
+async def test_automated_actions_wait_for_approval_by_default(ir_agent):
+    result = await ir_agent.run({
+        "incident": {"title": "Test"},
+        "threat_assessment": {"threat_type": "brute_force"},
+    })
+    assert result["actions_taken"] == []
+    automated = [a for a in result["response_plan"]["containment_actions"] if a.get("automated")]
+    assert automated and all(a["status"] == "pending_approval" for a in automated)
+    assert "1 awaiting approval" in result["summary"]
+
+
+async def test_without_approval_actions_are_simulated_not_completed(ir_agent, monkeypatch):
+    """With no integration configured nothing runs, so nothing may claim 'completed'."""
+    from core.config import settings
+    monkeypatch.setattr(settings, "containment_require_approval", False)
     result = await ir_agent.run({
         "incident": {"title": "Test"},
         "threat_assessment": {"threat_type": "brute_force"},
     })
     automated = result["actions_taken"]
     assert automated, "expected at least one automated containment action"
-    assert all(a["status"] == "completed" for a in automated)
+    assert all(a["status"] == "simulated" for a in automated)
+    assert all(a["result"]["executor"] == "simulate" for a in automated)
     # Manual steps are left for a human and must not be marked done.
     manual = [
         a for a in result["response_plan"]["containment_actions"] if not a.get("automated")
     ]
     assert all(a["status"] == "pending" for a in manual)
+
+
+async def test_caller_incident_id_wins_over_the_llm(ir_agent, fake_cache):
+    caller_id = "a3a3a3a3-1111-4222-8333-444455556666"
+    result = await ir_agent.run({"incident": {"id": caller_id, "title": "T"}, "threat_assessment": {}})
+    assert result["incident_id"] == caller_id
+    assert result["response_plan"]["incident_id"] == caller_id
+    # The model's own label is kept for reference only.
+    assert result["response_plan"]["llm_reference"] == IR_PLAN["incident_id"]
+
+
+async def test_llm_ids_do_not_collide_across_incidents(fake_cache):
+    """Two incidents whose plans carry the same model-invented id stay separate."""
+    agent = build_agent({**IR_PLAN, "incident_id": "INC-001"})
+    first = await agent.run({"incident": {"title": "one"}, "threat_assessment": {}})
+    second = await agent.run({"incident": {"title": "two"}, "threat_assessment": {}})
+    assert first["incident_id"] != second["incident_id"]
+    assert (await fake_cache.get(f"incident:{first['incident_id']}"))["title"] == "one"
+    assert (await fake_cache.get(f"incident:{second['incident_id']}"))["title"] == "two"
 
 
 async def test_incident_stored_in_redis(ir_agent, fake_cache):

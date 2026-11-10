@@ -1,114 +1,101 @@
 """
-Retrieval-augmented chains over the three ChromaDB collections.
+Retrieval over the three ChromaDB collections.
 
-Each chain is wrapped in `LazyRagChain`: the underlying LangChain runnable is only
-built the first time it is invoked, and any failure (Chroma down, no API key, empty
-collection) is swallowed and reported as an empty context string. Agents therefore
-run with or without a populated knowledge base — retrieval is an enhancement, not a
-hard dependency.
+Each retriever is wrapped in `LazyRagChain`: the underlying LangChain retriever is only
+built the first time it is used, and any failure (Chroma down, no API key, embedding
+model retired) is reported as an empty context string. Agents therefore run with or
+without a populated knowledge base — retrieval is an enhancement, not a hard
+dependency.
+
+This returns the retrieved passages themselves. It used to pipe them through a
+second Gemini call and hand that model's *answer* to the agent as "context", which
+doubled every agent's LLM usage and replaced source text with a paraphrase.
 """
 from __future__ import annotations
+
+import time
+
 import structlog
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+
 from core.config import settings
 from core.rag.vector_store import vector_store
 
 log = structlog.get_logger()
 
+DEFAULT_K = 5
+MAX_CONTEXT_CHARS = 4000
+
 
 def _format_docs(docs) -> str:
-    return "\n\n".join(d.page_content for d in docs)
+    text = "\n\n".join(d.page_content for d in docs if getattr(d, "page_content", ""))
+    return text[:MAX_CONTEXT_CHARS]
 
 
-def build_rag_chain(collection: str, system_prompt: str):
-    """Returns a RAG chain backed by the given ChromaDB collection."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    llm = ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
-        google_api_key=settings.google_api_key,
-        temperature=0.1,
-    )
-    retriever = vector_store.as_retriever(collection, search_kwargs={"k": 5})
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt + "\n\nContext from knowledge base:\n{context}"),
-        ("human", "{question}"),
-    ])
-
-    return (
-        {"context": retriever | _format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+def build_retriever(collection: str, k: int = DEFAULT_K):
+    """Returns a retriever backed by the given ChromaDB collection."""
+    return vector_store.as_retriever(collection, search_kwargs={"k": k})
 
 
 class LazyRagChain:
-    """Deferred, failure-tolerant wrapper around a RAG chain."""
+    """Deferred, failure-tolerant retriever with a back-off after errors."""
 
-    def __init__(self, collection_setting: str, system_prompt: str):
+    def __init__(self, collection_setting: str, label: str):
         self._collection_setting = collection_setting
-        self._system_prompt = system_prompt
-        self._chain = None
+        self.label = label
+        self._retriever = None
         self._disabled = False
+        self._retry_after = 0.0
 
     @property
     def collection(self) -> str:
         return getattr(settings, self._collection_setting)
 
     def _build(self):
-        if self._chain is None:
-            self._chain = build_rag_chain(self.collection, self._system_prompt)
-        return self._chain
+        if self._retriever is None:
+            self._retriever = build_retriever(self.collection)
+        return self._retriever
+
+    def _available(self) -> bool:
+        return not self._disabled and settings.rag_enabled and time.monotonic() >= self._retry_after
+
+    def _failed(self, exc: Exception) -> str:
+        # Drop the half-built retriever so the next attempt reconnects, and stop
+        # retrying on every call: a dead embedding model used to cost a failed API
+        # request (and a warning) per agent step.
+        self._retriever = None
+        self._retry_after = time.monotonic() + max(settings.rag_retry_after_seconds, 0)
+        log.warning(
+            "rag.unavailable", collection=self.collection, error=str(exc),
+            retry_in_s=settings.rag_retry_after_seconds,
+        )
+        return ""
 
     async def ainvoke(self, question: str) -> str:
-        """Retrieve and answer. Returns "" instead of raising when RAG is unavailable."""
-        if self._disabled or not settings.rag_enabled:
+        """Retrieve context. Returns "" instead of raising when RAG is unavailable."""
+        if not self._available():
             return ""
         try:
-            return await self._build().ainvoke(question)
+            return _format_docs(await self._build().ainvoke(question))
         except Exception as exc:
-            log.warning("rag.unavailable", collection=self.collection, error=str(exc))
-            # Drop the half-built chain so a later call can retry against a
-            # recovered ChromaDB instead of reusing a broken retriever.
-            self._chain = None
-            return ""
+            return self._failed(exc)
 
     def invoke(self, question: str) -> str:
-        if self._disabled or not settings.rag_enabled:
+        if not self._available():
             return ""
         try:
-            return self._build().invoke(question)
+            return _format_docs(self._build().invoke(question))
         except Exception as exc:
-            log.warning("rag.unavailable", collection=self.collection, error=str(exc))
-            self._chain = None
-            return ""
+            return self._failed(exc)
 
     def disable(self) -> None:
         self._disabled = True
 
     def reset(self) -> None:
-        self._chain = None
+        self._retriever = None
         self._disabled = False
+        self._retry_after = 0.0
 
 
-threat_rag = LazyRagChain(
-    "chroma_collection_threats",
-    "You are a cyber threat intelligence analyst. Use the provided context to answer questions "
-    "about threats, IOCs, TTPs, and threat actors. Be precise and cite MITRE ATT&CK where applicable.",
-)
-
-vuln_rag = LazyRagChain(
-    "chroma_collection_vulns",
-    "You are a vulnerability management expert. Use the provided context to analyze CVEs, "
-    "assess risk, and recommend remediation steps.",
-)
-
-compliance_rag = LazyRagChain(
-    "chroma_collection_compliance",
-    "You are a compliance and security policy expert. Use the provided context to evaluate "
-    "compliance status against frameworks like SOC2, ISO 27001, NIST CSF, and PCI-DSS.",
-)
+threat_rag = LazyRagChain("chroma_collection_threats", "threat intelligence")
+vuln_rag = LazyRagChain("chroma_collection_vulns", "vulnerability knowledge base")
+compliance_rag = LazyRagChain("chroma_collection_compliance", "compliance policies")

@@ -2,10 +2,44 @@ import { create } from "zustand";
 
 export type ThreatLevel = "critical" | "high" | "medium" | "low";
 
+export const THREAT_LEVELS: readonly ThreatLevel[] = ["critical", "high", "medium", "low"];
+
+export function isThreatLevel(value: unknown): value is ThreatLevel {
+  return typeof value === "string" && (THREAT_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * The agents that make up the mesh. Socket frames also arrive from non-agent
+ * publishers ("human" overrides, the "simulation" producer); those must never show
+ * up as agents on the status grid.
+ */
+export const KNOWN_AGENTS = [
+  "threat_detection",
+  "log_analysis",
+  "vulnerability_intel",
+  "incident_response",
+  "compliance",
+  "reporting",
+  "supervisor",
+] as const;
+
+export type AgentName = (typeof KNOWN_AGENTS)[number];
+
+export function isKnownAgent(value: unknown): value is AgentName {
+  return typeof value === "string" && (KNOWN_AGENTS as readonly string[]).includes(value);
+}
+
+export type AgentRunStatus = "idle" | "running" | "error" | "disabled";
+
 export interface AgentStatus {
   name: string;
-  status: "idle" | "running" | "error" | "disabled";
+  status: AgentRunStatus;
   task_id?: string;
+  /**
+   * When the socket reported this status (ms since epoch). The status grid also
+   * polls the REST snapshot, and whichever of the two is newer wins.
+   */
+  updatedAt?: number;
 }
 
 export interface Alert {

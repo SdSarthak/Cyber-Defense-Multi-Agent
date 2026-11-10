@@ -1,5 +1,19 @@
 version: "3.9"
 
+# Containers reach each other by service name. .env (copied from .env.example) points
+# at localhost for running the API directly on the host, so every in-network service
+# overrides the hosts here; without this the API and simulator containers tried to
+# reach PostgreSQL, Redis, Elasticsearch and ChromaDB on their own loopback.
+x-service-hosts: &service-hosts
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  ELASTICSEARCH_HOST: elasticsearch
+  ELASTICSEARCH_PORT: "9200"
+  CHROMA_HOST: chromadb
+  CHROMA_PORT: "8000"
+
 services:
   # ── PostgreSQL ────────────────────────────────────────────────────────────
   postgres:
@@ -72,8 +86,16 @@ services:
       dockerfile: infra/docker/Dockerfile.api
     container_name: cd_api
     env_file: .env
+    environment: *service-hosts
     ports:
       - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,19 +107,23 @@ services:
         condition: service_started
     volumes:
       - .:/app
+    # Migrations run on startup (RUN_MIGRATIONS_ON_STARTUP); --reload is for the
+    # bind-mounted dev source. Drop both the mount and --reload for production.
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ── Dashboard (React) ─────────────────────────────────────────────────────
   dashboard:
     build:
-      context: ./dashboard
-      dockerfile: ../infra/docker/Dockerfile.dashboard
+      context: .
+      dockerfile: infra/docker/Dockerfile.dashboard
+      # Inlined into the bundle at build time — the browser, not the container,
+      # calls the API, so these are host-facing URLs.
+      args:
+        REACT_APP_API_URL: http://localhost:8000
+        REACT_APP_WS_URL: ws://localhost:8000
     container_name: cd_dashboard
     ports:
       - "3000:3000"
-    environment:
-      - REACT_APP_API_URL=http://localhost:8000
-      - REACT_APP_WS_URL=ws://localhost:8000
     depends_on:
       - api
 
@@ -108,10 +134,13 @@ services:
       dockerfile: infra/docker/Dockerfile.api
     container_name: cd_simulator
     env_file: .env
+    environment: *service-hosts
+    restart: unless-stopped
     depends_on:
-      - api
-      - redis
-      - elasticsearch
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
     command: python -m simulation.engine
     volumes:
       - .:/app

@@ -6,8 +6,10 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Skip logging setup when the API runs migrations in-process: fileConfig() would
+# otherwise disable uvicorn's and structlog's already-configured loggers.
+if config.config_file_name is not None and not config.attributes.get("skip_logging_config"):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Import all models so Alembic can detect schema changes
 from core.config import settings
@@ -16,8 +18,11 @@ import core.database.models  # noqa: F401 — registers all ORM models
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url from settings so .env is respected
-config.set_main_option("sqlalchemy.url", settings.postgres_url)
+# Override sqlalchemy.url from settings so .env is respected. A caller (the Postgres
+# integration tests) may pin a specific database through config.attributes.
+config.set_main_option(
+    "sqlalchemy.url", config.attributes.get("sqlalchemy_url") or settings.postgres_url
+)
 
 
 def run_migrations_offline() -> None:

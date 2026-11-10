@@ -6,7 +6,7 @@ from core.config import settings
 # Reached through the module object rather than imported by value, so the one
 # patch point used everywhere else in the codebase also swaps the store here.
 from core.database import redis_client
-from simulation.log_generators.generators import generate_batch, ATTACK_GENERATORS, make_web_log
+from simulation.log_generators.generators import generate_batch, ATTACK_GENERATORS, make_web_log, _ts
 
 log = structlog.get_logger()
 
@@ -68,6 +68,22 @@ class SimulationEngine:
         if entries:
             await redis_client.cache.ltrim(LOG_QUEUE_KEY, 0, MAX_QUEUE_LENGTH - 1)
 
+    async def _escalate(self, payload: dict) -> None:
+        """
+        Optionally raise an escalation for an injected scenario.
+
+        Off by default (SIMULATION_INJECT_ESCALATIONS): the simulator used to publish
+        the escalation itself, so incidents appeared whether or not any detection
+        agent noticed the attack. Now the queued logs have to be caught by log
+        analysis, which escalates on its own. When enabled, the escalation goes to the
+        same durable stream the agents use.
+        """
+        if not settings.simulation_inject_escalations:
+            return
+        from agents.base_agent import ESCALATION_STREAM
+        await redis_client.cache.xadd(ESCALATION_STREAM, payload)
+        await redis_client.cache.publish("escalations", payload)
+
     async def _log_producer(self):
         """Generate logs at the configured rate and push to Redis for log analysis agent."""
         while self._running:
@@ -103,11 +119,12 @@ class SimulationEngine:
         attacker_ip = "185.220.101.45"
         batch = [
             {"source": "sshd", "message": f"Failed password for root from {attacker_ip} port {p} ssh2",
-             "log_level": "WARNING", "parsed_fields": {"src_ip": attacker_ip, "attack_type": "brute_force"}}
+             "timestamp": _ts(), "log_level": "WARNING",
+             "parsed_fields": {"src_ip": attacker_ip, "attack_type": "brute_force"}}
             for p in range(10000, 10050)
         ]
         await self._enqueue(batch)
-        await redis_client.cache.publish("escalations", {
+        await self._escalate({
             "agent": "simulation",
             "severity": "high",
             "threat_type": "brute_force",
@@ -123,13 +140,13 @@ class SimulationEngine:
             "/login?user=admin'--&pass=x",
         ]
         batch = [
-            {"source": "nginx", "log_level": "WARNING",
+            {"source": "nginx", "log_level": "WARNING", "timestamp": _ts(),
              "message": f'200 GET {p} HTTP/1.1 from {attacker_ip}',
              "parsed_fields": {"src_ip": attacker_ip, "path": p, "attack_type": "sql_injection"}}
             for p in payloads
         ]
         await self._enqueue(batch)
-        await redis_client.cache.publish("escalations", {
+        await self._escalate({
             "agent": "simulation",
             "severity": "critical",
             "threat_type": "sql_injection",
@@ -158,12 +175,12 @@ class SimulationEngine:
                                "size_mb": 500, "attack_type": "data_exfiltration", "stage": "exfil"}},
         ]
         for i, stage in enumerate(stages):
-            await self._enqueue([stage])
+            await self._enqueue([{**stage, "timestamp": _ts()}])
             # Space the stages apart, but do not idle after the final one — the
             # escalation for a completed campaign should not wait on a dead delay.
             if i < len(stages) - 1:
                 await asyncio.sleep(APT_STAGE_DELAY_SECONDS)
-        await redis_client.cache.publish("escalations", {
+        await self._escalate({
             "agent": "simulation",
             "severity": "critical",
             "threat_type": "apt_campaign",

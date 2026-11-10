@@ -1,4 +1,4 @@
-"""Unit tests for AgentMemory short-term + blackboard storage."""
+"""Unit tests for AgentMemory history + blackboard storage."""
 import pytest
 
 from core.memory.agent_memory import HISTORY_LIMIT, AgentMemory
@@ -8,36 +8,6 @@ from core.memory.agent_memory import HISTORY_LIMIT, AgentMemory
 def memory(fake_cache):
     """AgentMemory backed by the autouse in-memory cache from conftest."""
     return AgentMemory("test_agent")
-
-
-async def test_remember_and_recall(memory):
-    await memory.remember("key1", {"value": 42})
-    assert await memory.recall("key1") == {"value": 42}
-
-
-async def test_recall_missing_key_returns_none(memory):
-    assert await memory.recall("never_set") is None
-
-
-async def test_forget(memory):
-    await memory.remember("key2", "hello")
-    await memory.forget("key2")
-    assert await memory.recall("key2") is None
-
-
-async def test_task_context(memory):
-    ctx = {"incident_id": "abc", "severity": "high"}
-    await memory.set_task_context("task-1", ctx)
-    assert await memory.get_task_context("task-1") == ctx
-
-
-def test_working_memory_structure(memory):
-    wm = memory.new_working_memory()
-    assert wm["agent"] == "test_agent"
-    assert isinstance(wm["observations"], list)
-    assert isinstance(wm["decisions"], list)
-    assert isinstance(wm["tool_calls"], list)
-    assert wm["started_at"]
 
 
 async def test_log_event(memory):
@@ -93,12 +63,10 @@ async def test_blackboard_update_replaces_non_dict_value(memory):
     assert await memory.blackboard_get("state") == {"b": 2}
 
 
-async def test_namespace_isolation(memory, fake_cache):
+async def test_history_is_namespaced_per_agent(memory, fake_cache):
     other = AgentMemory("other_agent")
-    await memory.remember("shared_key", "agent_value")
-    await other.remember("shared_key", "other_value")
+    await memory.log_event({"type": "mine"})
+    await other.log_event({"type": "theirs"})
 
-    assert "agent:test_agent:st:shared_key" in fake_cache.store
-    assert "agent:other_agent:st:shared_key" in fake_cache.store
-    assert await memory.recall("shared_key") == "agent_value"
-    assert await other.recall("shared_key") == "other_value"
+    assert [e["type"] for e in await memory.get_history()] == ["mine"]
+    assert [e["type"] for e in await other.get_history()] == ["theirs"]

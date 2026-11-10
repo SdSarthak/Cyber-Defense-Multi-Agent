@@ -6,7 +6,7 @@ Create Date: 2026-05-08
 """
 from typing import Sequence, Union
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import UUID, JSON
+from sqlalchemy.dialects.postgresql import ENUM, UUID, JSON
 from alembic import op
 
 revision: str = "0001"
@@ -14,13 +14,20 @@ down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-severity_enum = sa.Enum("critical", "high", "medium", "low", "info", name="severitylevel")
-incident_status_enum = sa.Enum("open", "investigating", "contained", "resolved", "false_positive", name="incidentstatus")
-agent_status_enum = sa.Enum("idle", "running", "error", "disabled", name="agentstatus")
+# create_type=False: the types are created once, explicitly, in upgrade(). With a plain
+# sa.Enum, op.create_table() issued CREATE TYPE again and the migration aborted with
+# 'type "severitylevel" already exists' on every fresh database.
+severity_enum = ENUM("critical", "high", "medium", "low", "info", name="severitylevel", create_type=False)
+incident_status_enum = ENUM(
+    "open", "investigating", "contained", "resolved", "false_positive",
+    name="incidentstatus", create_type=False,
+)
+agent_status_enum = ENUM("idle", "running", "error", "disabled", name="agentstatus", create_type=False)
 
 
 def upgrade() -> None:
-    op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+    # gen_random_uuid() is built into PostgreSQL 13+, so no extension is required
+    # (uuid-ossp is missing on several managed and embedded distributions).
 
     severity_enum.create(op.get_bind(), checkfirst=True)
     incident_status_enum.create(op.get_bind(), checkfirst=True)
@@ -28,7 +35,7 @@ def upgrade() -> None:
 
     op.create_table(
         "incidents",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("title", sa.String(255), nullable=False),
         sa.Column("description", sa.Text),
         sa.Column("severity", severity_enum, nullable=False, server_default="medium"),
@@ -47,7 +54,7 @@ def upgrade() -> None:
 
     op.create_table(
         "threat_events",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("source_ip", sa.String(45)),
         sa.Column("destination_ip", sa.String(45)),
         sa.Column("source_port", sa.Integer),
@@ -71,7 +78,7 @@ def upgrade() -> None:
 
     op.create_table(
         "vulnerabilities",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("cve_id", sa.String(30), unique=True),
         sa.Column("title", sa.String(500), nullable=False),
         sa.Column("description", sa.Text),
@@ -91,7 +98,7 @@ def upgrade() -> None:
 
     op.create_table(
         "compliance_checks",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("framework", sa.String(50), nullable=False),
         sa.Column("control_id", sa.String(50), nullable=False),
         sa.Column("control_name", sa.String(255), nullable=False),
@@ -107,7 +114,7 @@ def upgrade() -> None:
 
     op.create_table(
         "agent_registry",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("agent_name", sa.String(100), unique=True, nullable=False),
         sa.Column("agent_type", sa.String(100), nullable=False),
         sa.Column("status", agent_status_enum, nullable=False, server_default="idle"),
@@ -123,7 +130,7 @@ def upgrade() -> None:
 
     op.create_table(
         "agent_actions",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("agent_name", sa.String(100), nullable=False),
         sa.Column("action_type", sa.String(100), nullable=False),
         sa.Column("description", sa.Text),
@@ -139,7 +146,7 @@ def upgrade() -> None:
 
     op.create_table(
         "log_entries",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("uuid_generate_v4()")),
+        sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("source", sa.String(100), nullable=False),
         sa.Column("log_level", sa.String(20), nullable=False),
         sa.Column("message", sa.Text, nullable=False),
@@ -158,13 +165,13 @@ def upgrade() -> None:
     # Seed default agent registry entries
     op.execute("""
         INSERT INTO agent_registry (id, agent_name, agent_type, status) VALUES
-        (uuid_generate_v4(), 'threat_detection',   'ThreatDetectionAgent',      'idle'),
-        (uuid_generate_v4(), 'log_analysis',        'LogAnalysisAgent',           'idle'),
-        (uuid_generate_v4(), 'vulnerability_intel', 'VulnerabilityIntelAgent',    'idle'),
-        (uuid_generate_v4(), 'incident_response',   'IncidentResponseAgent',      'idle'),
-        (uuid_generate_v4(), 'compliance',          'ComplianceAgent',            'idle'),
-        (uuid_generate_v4(), 'reporting',           'ReportingAgent',             'idle'),
-        (uuid_generate_v4(), 'supervisor',          'SupervisorAgent',            'idle')
+        (gen_random_uuid(), 'threat_detection',   'ThreatDetectionAgent',      'idle'),
+        (gen_random_uuid(), 'log_analysis',        'LogAnalysisAgent',           'idle'),
+        (gen_random_uuid(), 'vulnerability_intel', 'VulnerabilityIntelAgent',    'idle'),
+        (gen_random_uuid(), 'incident_response',   'IncidentResponseAgent',      'idle'),
+        (gen_random_uuid(), 'compliance',          'ComplianceAgent',            'idle'),
+        (gen_random_uuid(), 'reporting',           'ReportingAgent',             'idle'),
+        (gen_random_uuid(), 'supervisor',          'SupervisorAgent',            'idle')
         ON CONFLICT (agent_name) DO NOTHING
     """)
 

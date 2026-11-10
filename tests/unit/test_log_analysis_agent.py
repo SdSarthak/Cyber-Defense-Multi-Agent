@@ -33,9 +33,11 @@ def log_agent(fake_cache):
 
 
 async def test_log_agent_returns_anomalies(log_agent):
-    logs = generate_batch(size=20, attack_probability=0.3)
+    logs = [{"message": "routine cron run"} for _ in range(20)]
     result = await log_agent.run({"logs": logs})
+    # Clean logs: only the model's two findings, no signature-based additions.
     assert len(result["anomalies"]) == 2
+    assert {a["detector"] for a in result["anomalies"]} == {"llm"}
     assert "pattern_hits" in result
     assert result["risk_summary"] == "Active attack detected"
 
@@ -118,16 +120,65 @@ async def test_pattern_scan_ignores_clean_logs(log_agent):
 async def test_anomalies_sorted_by_severity(log_agent):
     logs = generate_batch(size=30, attack_probability=0.5)
     result = await log_agent.run({"logs": logs})
-    severities = [a["severity"] for a in result["anomalies"]]
-    assert severities == ["critical", "high"]
+    rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    ranks = [rank[a["severity"]] for a in result["anomalies"]]
+    assert ranks == sorted(ranks, reverse=True)
+    assert ranks[0] == 4  # the model's critical C2 finding leads
 
 
-async def test_high_severity_anomalies_escalate(log_agent, fake_cache):
-    logs = [make_c2_beacon_log() for _ in range(5)]
-    await log_agent.run({"logs": logs})
+async def test_high_severity_anomalies_escalate_once_per_attacker(fake_cache):
+    agent = build_agent({**LLM_ANALYSIS, "anomalies": []})
+    attacker = "185.220.101.45"
+    logs = [make_brute_force_log(attacker) for _ in range(8)]
+    logs += [{"message": "GET /?id=1' UNION SELECT * FROM users--",
+              "parsed_fields": {"src_ip": "91.108.4.0"}} for _ in range(3)]
+    await agent.run({"logs": logs})
+
     escalations = fake_cache.messages_on("escalations")
-    assert len(escalations) == 2
-    assert {e["severity"] for e in escalations} == {"critical", "high"}
+    by_type = {e["threat_type"]: e for e in escalations}
+    assert set(by_type) == {"brute_force", "sql_injection"}
+    # The payload carries the attacker, which the supervisor's cooldown and the
+    # incident's affected assets both key on.
+    assert by_type["brute_force"]["event"]["source_ip"] == attacker
+    assert by_type["sql_injection"]["event"]["source_ip"] == "91.108.4.0"
+    assert by_type["sql_injection"]["occurrences"] == 3
+    # Durable copy for the supervisor's consumer.
+    assert len(fake_cache.streams["escalations:stream"]) == 2
+
+
+async def test_signatures_escalate_even_when_the_llm_misses_them(fake_cache):
+    """A clear UNION SELECT must not depend on the model noticing it."""
+    agent = build_agent("not json")
+    logs = [{"message": "GET /?id=1' UNION SELECT password FROM users--",
+             "parsed_fields": {"src_ip": "203.0.113.99"}}]
+    result = await agent.run({"logs": logs})
+    assert [a["anomaly_type"] for a in result["anomalies"]] == ["sql_injection"]
+    assert result["anomalies"][0]["detector"] == "pattern"
+    assert fake_cache.messages_on("escalations")[0]["severity"] == "high"
+
+
+async def test_isolated_failed_logins_are_not_brute_force(fake_cache):
+    agent = build_agent({**LLM_ANALYSIS, "anomalies": []})
+    logs = [make_brute_force_log(f"198.51.100.{i}") for i in range(10)]
+    result = await agent.run({"logs": logs})
+    assert result["anomalies"] == []
+    assert fake_cache.messages_on("escalations") == []
+
+
+async def test_simulator_labels_are_not_read_by_the_detector(log_agent):
+    """parsed_fields.attack_type is ground truth; detection must not see it."""
+    logs = [{"message": "ordinary request", "parsed_fields": {"attack_type": "data_exfiltration"}}]
+    result = await log_agent.run({"logs": logs})
+    assert result["pattern_hits"] == {}
+
+
+async def test_on_hits_mode_skips_the_llm_for_clean_batches(fake_cache, monkeypatch):
+    from core.config import settings
+    monkeypatch.setattr(settings, "log_analysis_llm_mode", "on_hits")
+    agent = build_agent()
+    result = await agent.run({"logs": [{"message": "routine cron run"}]})
+    assert result["llm_skipped"] is True
+    assert agent.llm.calls == []
 
 
 async def test_low_severity_anomalies_do_not_escalate(fake_cache):
@@ -161,7 +212,8 @@ async def test_malformed_entries_are_filtered(log_agent):
 
 async def test_malformed_llm_output_degrades_to_pattern_hits(fake_cache):
     agent = build_agent("total gibberish, no json")
-    logs = [make_brute_force_log() for _ in range(3)]
+    logs = [make_brute_force_log("185.220.101.45") for _ in range(3)]
     result = await agent.run({"logs": logs})
+    # Three failures is below the brute-force threshold: a hit, not an anomaly.
     assert result["anomalies"] == []
     assert "brute_force" in result["pattern_hits"]

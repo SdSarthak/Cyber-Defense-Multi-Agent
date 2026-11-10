@@ -1,12 +1,16 @@
 """WebSocket connection manager + Redis pub/sub bridge for real-time dashboard updates."""
 import asyncio
 import json
+import os
+import socket
+import time
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jose import JWTError, jwt
 
-from core import metrics
+from agents.base_agent import ESCALATION_STREAM
+from core import metrics, threat_level as threat_levels
 from core.config import settings
 from core.database import redis_client
 
@@ -19,8 +23,13 @@ CHANNELS = ["agent_events", "escalations", "incident_updates"]
 # Commands a dashboard operator may issue over the socket.
 OVERRIDE_COMMANDS = ("pause_agent", "resume_agent", "set_threat_level", "run_agent")
 
-# Overrides that mutate agent state are admin-only; everyone else gets read-only telemetry.
-ADMIN_ONLY_COMMANDS = ("pause_agent", "resume_agent", "run_agent")
+# Every override mutates shared state, so all of them are admin-only; the analyst role
+# is read-only telemetry, on the socket exactly as on the REST API.
+ADMIN_ONLY_COMMANDS = ("pause_agent", "resume_agent", "set_threat_level", "run_agent")
+
+ESCALATION_GROUP = "supervisor"
+# An entry read by a consumer that then died is re-delivered after this long.
+ESCALATION_RECLAIM_IDLE_MS = 60_000
 
 # RFC 6455 close codes. 1008 = policy violation, which is what browsers surface for
 # an auth failure during the handshake.
@@ -79,15 +88,24 @@ class ConnectionManager:
             self._connections.remove(ws)
         metrics.websocket_connections_active.set(len(self._connections))
 
-    async def broadcast(self, message: dict):
-        dead = []
-        for ws in list(self._connections):
+    async def broadcast(self, message: dict, send_timeout: float = 5.0):
+        """
+        Fan out concurrently with a per-client timeout: a sequential loop let one
+        stalled browser hold up the feed for every other operator.
+        """
+        connections = list(self._connections)
+
+        async def _send(ws: WebSocket) -> bool:
             try:
-                await ws.send_json(message)
+                await asyncio.wait_for(ws.send_json(message), timeout=send_timeout)
+                return True
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+                return False
+
+        delivered = await asyncio.gather(*(_send(ws) for ws in connections))
+        for ws, ok in zip(connections, delivered):
+            if not ok:
+                self.disconnect(ws)
 
 
 manager = ConnectionManager()
@@ -103,7 +121,8 @@ async def _subscribe(channels: list[str]):
     while True:
         pubsub = None
         try:
-            pubsub = redis_client.get_redis().pubsub()
+            # Blocking pool: a read timeout would fire every time the channel is quiet.
+            pubsub = redis_client.get_blocking_redis().pubsub()
             await pubsub.subscribe(*channels)
             async for message in pubsub.listen():
                 if message.get("type") != "message":
@@ -132,22 +151,58 @@ async def redis_listener():
         await manager.broadcast({"channel": channel, "data": data})
 
 
-async def escalation_listener(supervisor):
-    """
-    Background task: forward escalations to the Supervisor so it can open an incident.
+def _consumer_name() -> str:
+    return f"{socket.gethostname()}-{os.getpid()}"
 
-    Previously `SupervisorAgent.handle_escalation` existed but nothing ever called it,
-    so a critical escalation reached the dashboard and stopped there.
+
+async def process_escalations_once(supervisor, consumer: str, block_ms: int = 5000) -> int:
     """
+    Handle one batch from the escalation stream. Returns how many entries were handled.
+
+    Entries another consumer read but never acknowledged (it crashed mid-response) are
+    reclaimed first; otherwise new entries are read. Each entry is acknowledged only
+    after the supervisor has handled it, so an API restart no longer loses whatever
+    was in flight — pub/sub, which this replaced, dropped anything published while
+    the listener was down or slow.
+    """
+    cache = redis_client.cache
+    await cache.ensure_group(ESCALATION_STREAM, ESCALATION_GROUP)
+    batch = await cache.xautoclaim(
+        ESCALATION_STREAM, ESCALATION_GROUP, consumer, min_idle_ms=ESCALATION_RECLAIM_IDLE_MS
+    )
+    if not batch:
+        batch = await cache.xreadgroup(
+            ESCALATION_STREAM, ESCALATION_GROUP, consumer, count=10, block_ms=block_ms
+        )
+    for entry_id, escalation in batch:
+        try:
+            if isinstance(escalation, dict):
+                await supervisor.handle_escalation(escalation)
+        except asyncio.CancelledError:
+            raise  # unacknowledged: another consumer (or this one, restarted) reclaims it
+        except Exception as exc:
+            # A failure inside the response is logged and acknowledged, so one poison
+            # entry cannot wedge the queue.
+            log.warning("escalation_listener.failed", error=str(exc))
+        await cache.xack(ESCALATION_STREAM, ESCALATION_GROUP, entry_id)
+    return len(batch)
+
+
+async def escalation_listener(supervisor):
+    """Background task: hand queued escalations to the Supervisor to open incidents."""
     if not settings.escalation_auto_response:
         return
-    async for _, escalation in _subscribe(["escalations"]):
+    consumer = _consumer_name()
+    while True:
         try:
-            await supervisor.handle_escalation(escalation)
+            handled = await process_escalations_once(supervisor, consumer)
+            if not handled:
+                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("escalation_listener.failed", error=str(exc))
+            log.warning("escalation_listener.reconnecting", error=str(exc))
+            await asyncio.sleep(2.0)
 
 
 def _reject_unknown_agent(command: str, agent, supervisor) -> dict | None:
@@ -166,7 +221,7 @@ def _reject_unknown_agent(command: str, agent, supervisor) -> dict | None:
     return None
 
 
-async def _handle_override(command: str, payload: dict, supervisor=None) -> dict:
+async def _handle_override(command: str, payload: dict, supervisor=None, user: str | None = None) -> dict:
     """Apply a human override command. Returns a result payload for the caller."""
     from agents.base_agent import BaseSecurityAgent
 
@@ -187,10 +242,10 @@ async def _handle_override(command: str, payload: dict, supervisor=None) -> dict
         return {"ok": True, "agent": agent, "status": "resumed"}
 
     if command == "set_threat_level":
-        level = str(payload.get("threat_level", "low")).lower()
-        from core.memory.agent_memory import AgentMemory
-        await AgentMemory.blackboard_set("threat_level", level, ttl=3600)
-        metrics.set_threat_level(level)
+        try:
+            level = await threat_levels.override(payload.get("threat_level"), user=user or "unknown")
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         return {"ok": True, "threat_level": level}
 
     if command == "run_agent":
@@ -214,6 +269,9 @@ async def websocket_endpoint(ws: WebSocket):
         return
 
     role = claims.get("role", "analyst")
+    # Authenticated once at the handshake, so enforce the token's lifetime here too:
+    # the socket (and its role) used to outlive the token indefinitely.
+    expires_at = claims.get("exp")
     await manager.connect(ws)
     await ws.send_json({
         "type": "connected",
@@ -224,18 +282,29 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             # Accept any incoming messages (human override commands)
-            raw = await ws.receive_text()
+            if expires_at:
+                remaining = float(expires_at) - time.time()
+                if remaining <= 0:
+                    await ws.close(code=WS_POLICY_VIOLATION, reason="Token expired")
+                    break
+                try:
+                    raw = await asyncio.wait_for(ws.receive_text(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    await ws.close(code=WS_POLICY_VIOLATION, reason="Token expired")
+                    break
+            else:
+                raw = await ws.receive_text()
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 await ws.send_json({"type": "error", "error": "Malformed JSON"})
                 continue
 
-            if msg.get("type") != "human_override":
+            if not isinstance(msg, dict) or msg.get("type") != "human_override":
                 continue
 
             command = str(msg.get("command", ""))
-            payload = msg.get("payload") or {}
+            payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
             if command not in OVERRIDE_COMMANDS:
                 await ws.send_json({
                     "type": "override_result",
@@ -255,7 +324,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             try:
                 supervisor = getattr(ws.app.state, "supervisor", None)
-                result = await _handle_override(command, payload, supervisor)
+                result = await _handle_override(command, payload, supervisor, user=claims.get("sub"))
             except Exception as exc:
                 log.warning("override.failed", command=command, error=str(exc))
                 result = {"ok": False, "error": str(exc)}

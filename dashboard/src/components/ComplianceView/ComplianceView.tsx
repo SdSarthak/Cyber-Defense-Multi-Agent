@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api } from "../../services/api";
+import { api, describeError } from "../../services/api";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
+import { ADMIN_ONLY_TITLE, AdminOnlyHint } from "../common/ui";
 
 const FRAMEWORK_COLORS: Record<string, string> = {
   pass: "#22c55e",
@@ -10,7 +11,12 @@ const FRAMEWORK_COLORS: Record<string, string> = {
   na: "#6b7280",
 };
 
-export function ComplianceView() {
+interface Props {
+  /** Evaluation runs the agent mesh and is admin-only on the server. */
+  canWrite?: boolean;
+}
+
+export function ComplianceView({ canWrite = false }: Props) {
   const [framework, setFramework] = useState("SOC2");
   const [result, setResult] = useState<any>(null);
 
@@ -19,7 +25,7 @@ export function ComplianceView() {
     queryFn: api.listFrameworks,
   });
 
-  const { mutate, isPending } = useMutation({
+  const { mutate, isPending, error } = useMutation({
     mutationFn: () => api.evaluateCompliance(framework),
     onSuccess: (data) => setResult(data),
   });
@@ -47,12 +53,15 @@ export function ComplianceView() {
         </select>
         <button
           onClick={() => mutate()}
-          disabled={isPending}
+          disabled={!canWrite || isPending}
+          title={canWrite ? undefined : ADMIN_ONLY_TITLE}
           className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-700 text-white rounded px-4 py-2 text-sm font-medium transition-colors"
         >
           {isPending ? "Evaluating…" : "Evaluate"}
         </button>
       </div>
+      {!canWrite && <AdminOnlyHint className="mb-3" />}
+      {error && <p className="text-red-400 text-xs mb-3">{describeError(error)}</p>}
 
       {result && (
         <div className="space-y-3">

@@ -1,7 +1,48 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createWebSocket } from "../services/api";
 import { logout } from "../services/auth";
-import { useStore } from "../store/useStore";
+import {
+  AgentName,
+  AgentRunStatus,
+  isKnownAgent,
+  isThreatLevel,
+  ThreatLevel,
+  useStore,
+} from "../store/useStore";
+
+/**
+ * The only `agent_events` that describe an agent's run state. Everything else on the
+ * channel — routing decisions, report notifications, operator overrides, simulator
+ * ticks — is informational, and used to flip the sender to "running" with nothing
+ * ever flipping it back.
+ */
+const STATUS_EVENTS: Record<string, AgentRunStatus> = {
+  task_start: "running",
+  task_complete: "idle",
+  task_error: "error",
+};
+
+/** Map an `agent_events` payload to a status change, or null when it is not one. */
+export function agentStatusFromEvent(
+  data: any,
+): { agent: AgentName; status: AgentRunStatus } | null {
+  const agent = data?.agent;
+  const event = data?.event;
+  if (!isKnownAgent(agent) || typeof event !== "string") return null;
+  const status = STATUS_EVENTS[event];
+  return status ? { agent, status } : null;
+}
+
+/**
+ * The effective threat level is announced on `agent_events` with event
+ * "threat_level". Other frames may carry a `threat_level` field too (an override's
+ * echoed payload, an escalation), but those are not the level the board is at.
+ */
+export function threatLevelFromFrame(msg: any): ThreatLevel | null {
+  if (msg?.channel !== "agent_events" || msg.data?.event !== "threat_level") return null;
+  const level = String(msg.data?.threat_level ?? "").toLowerCase();
+  return isThreatLevel(level) ? level : null;
+}
 
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
@@ -83,14 +124,24 @@ export function useWebSocket(enabled: boolean = true) {
           timestamp: new Date().toISOString(),
         });
 
-        if (msg.channel === "agent_events" && msg.data?.agent && msg.data?.event) {
-          setAgentStatus(msg.data.agent, {
-            name: msg.data.agent,
-            status: msg.data.event === "task_complete" ? "idle" : "running",
-          });
+        if (msg.channel === "agent_events") {
+          const update = agentStatusFromEvent(msg.data);
+          if (update) {
+            setAgentStatus(update.agent, {
+              name: update.agent,
+              status: update.status,
+              task_id:
+                update.status === "running" && typeof msg.data?.task_id === "string"
+                  ? msg.data.task_id
+                  : undefined,
+              updatedAt: Date.now(),
+            });
+          }
         }
-        if (msg.data?.threat_level) {
-          setThreatLevel(msg.data.threat_level);
+
+        const level = threatLevelFromFrame(msg);
+        if (level) {
+          setThreatLevel(level);
         }
       });
 
